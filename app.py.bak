@@ -1,0 +1,541 @@
+"""
+Main Flask application for the auto-learning website chatbot.
+Provides API endpoints and serves the demo interface.
+"""
+
+import os
+import json as _json
+from flask import Flask, request, jsonify, render_template, send_from_directory, Response, stream_with_context
+from dotenv import load_dotenv
+from src.rag import RAG
+from src.ai_extractor import extract_with_diffbot, extract_with_openai
+import threading
+import requests
+import time
+import concurrent.futures
+from functools import partial
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+
+# Configuration
+config = {
+    'scrape_delay': int(os.getenv('SCRAPE_DELAY', '2')),
+    'max_pages': int(os.getenv('MAX_PAGES', '100')),
+    'ollama_host': os.getenv('OLLAMA_HOST', 'http://localhost:11434'),
+    'model_name': os.getenv('MODEL_NAME', 'mistral:7b-q4_K_M'),  # Using quantized model
+    'quick_model_name': os.getenv('QUICK_MODEL_NAME', 'phi:latest'),
+    'speed_model_name': os.getenv('SPEED_MODEL_NAME', 'tinyllama:latest'),
+    'chunk_size': int(os.getenv('CHUNK_SIZE', '500')),
+    'chunk_overlap': int(os.getenv('CHUNK_OVERLAP', '50')),
+    'persist_directory': os.getenv('PERSIST_DIRECTORY', './data/chroma'),
+    'collection_name': os.getenv('COLLECTION_NAME', 'website_content'),
+    'num_thread': int(os.getenv('NUM_THREAD', '4')),
+    'num_ctx': int(os.getenv('NUM_CTX', '4096')),
+    'embed_cache_dir': os.getenv('EMBED_CACHE_DIR', './embed_cache'),
+    'use_streaming': os.getenv('USE_STREAMING', 'true').lower() in ('true', 'yes', '1')
+}
+
+CHAT_HISTORY_FILE = 'chat_history.json'
+
+def load_chat_history():
+    try:
+        with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            return _json.load(f)
+    except Exception:
+        return []
+
+def save_chat_history():
+    try:
+        with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            _json.dump(chat_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save chat history: {e}")
+
+# Initialize RAG system with optimized settings
+rag = RAG(config=config)
+
+# Store scraping status
+scraping_status = {
+    'is_scraping': False,
+    'current_url': None,
+    'documents_processed': 0,
+    'error': None,
+    'elapsed_time': None
+}
+
+chat_history = load_chat_history()
+
+# ThreadPoolExecutor for parallel processing
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=config['num_thread'])
+
+# Background jobs
+background_jobs = {}
+
+def store_chat_message(role, message):
+    chat_history.append({'role': role, 'message': message})
+    if len(chat_history) > 200:
+        chat_history.pop(0)
+    save_chat_history()
+
+@app.route('/')
+def index():
+    """Render the demo page."""
+    return render_template('index.html')
+
+@app.route('/embed/chatbot.js')
+def chatbot_js():
+    """Serve the embeddable chatbot script."""
+    return send_from_directory('embed', 'chatbot.js')
+
+@app.route('/api/scrape', methods=['POST'])
+def scrape_website():
+    """API endpoint to trigger website scraping."""
+    data = request.json
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
+    
+    if scraping_status['is_scraping']:
+        return jsonify({
+            'error': 'Already scraping a website',
+            'current_url': scraping_status['current_url']
+        }), 409
+    
+    # Reset status
+    scraping_status['is_scraping'] = True
+    scraping_status['current_url'] = url
+    scraping_status['documents_processed'] = 0
+    scraping_status['error'] = None
+    scraping_status['elapsed_time'] = None
+    
+    # Start scraping in a background thread
+    def scrape_task():
+        import time
+        start_time = time.time()
+        try:
+            num_docs = rag.scrape_website(url)
+            scraping_status['documents_processed'] = num_docs
+            
+            # Pre-cache common queries if any documents were processed
+            if num_docs > 0:
+                try:
+                    # Try to pre-cache some common queries to warm up the system
+                    executor.submit(
+                        rag.query,
+                        "What is this website about?",
+                        mode="quick"
+                    )
+                except Exception as e:
+                    print(f"Pre-caching error: {e}")
+        except Exception as e:
+            scraping_status['error'] = str(e)
+        finally:
+            end_time = time.time()
+            scraping_status['elapsed_time'] = round(end_time - start_time, 2)
+            scraping_status['is_scraping'] = False
+    
+    thread = threading.Thread(target=scrape_task)
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({'status': 'Scraping started', 'url': url})
+
+@app.route('/api/scrape/status', methods=['GET'])
+def get_scrape_status():
+    """API endpoint to check scraping status."""
+    return jsonify(scraping_status)
+
+@app.route('/api/query', methods=['POST'])
+def query():
+    """API endpoint to query the chatbot with optimized processing."""
+    data = request.json
+    user_query = data.get('query')
+    mode = data.get('mode', 'quick')  # Default to quick if not provided
+    stream = data.get('stream', config['use_streaming'])  # Default to config value
+    
+    if not user_query:
+        return jsonify({'error': 'Query is required'}), 400
+    
+    # Get optional parameters with defaults
+    n_results = data.get('n_results', 3)
+    temperature = data.get('temperature', 0.7)
+    
+    store_chat_message('user', user_query)
+    
+    # For streaming responses
+    if stream:
+        def generate():
+            contexts = []
+            first_chunk = True
+            
+            try:
+                # Get query embedding and contexts first (synchronously)
+                query_embedding = rag._get_cached_embedding(user_query)
+                retrieved_docs = rag.vectordb.query(query_embedding, n_results=n_results)
+                
+                # Format contexts for response
+                for doc in retrieved_docs:
+                    contexts.append({
+                        "text": doc['content'],
+                        "source": doc['metadata'].get('source', ''),
+                        "title": doc['metadata'].get('title', '')
+                    })
+                
+                # Stream the LLM response
+                if mode == "quick":
+                    stream_fn = rag.quick_llm.stream_answer_with_rag
+                elif mode == "speed":
+                    stream_fn = rag.speed_llm.stream_answer_with_rag
+                else:
+                    stream_fn = rag.llm.stream_answer_with_rag
+                
+                # Start with the contexts in the first chunk
+                if first_chunk:
+                    yield _json.dumps({
+                        "contexts": contexts,
+                        "answer": "",
+                        "complete": False
+                    }) + "\n"
+                    first_chunk = False
+                
+                # Start streaming the answer
+                answer_so_far = ""
+                for chunk in stream_fn(user_query, retrieved_docs, temperature=temperature):
+                    answer_so_far += chunk
+                    yield _json.dumps({
+                        "chunk": chunk,
+                        "answer": answer_so_far,
+                        "complete": False
+                    }) + "\n"
+                
+                # Final chunk with complete flag
+                yield _json.dumps({
+                    "answer": answer_so_far,
+                    "complete": True
+                }) + "\n"
+                
+                # Store the complete response in chat history
+                store_chat_message('bot', answer_so_far)
+                
+            except Exception as e:
+                # Handle errors in the stream
+                error_msg = f"Error during streaming: {str(e)}"
+                yield _json.dumps({
+                    "error": error_msg,
+                    "complete": True
+                }) + "\n"
+                store_chat_message('bot', f"[Error] {error_msg}")
+        
+        return Response(stream_with_context(generate()), content_type='application/x-ndjson')
+    else:
+        # Non-streaming response
+        result = rag.query(user_query, n_results=n_results, temperature=temperature, mode=mode)
+        store_chat_message('bot', result.get('answer', ''))
+        return jsonify(result)
+
+@app.route('/api/background_query', methods=['POST'])
+def background_query():
+    """API endpoint to start a query in the background."""
+    data = request.json
+    user_query = data.get('query')
+    mode = data.get('mode', 'quick')
+    
+    if not user_query:
+        return jsonify({'error': 'Query is required'}), 400
+    
+    # Generate a job ID
+    job_id = f"job_{int(time.time())}_{hash(user_query) % 10000}"
+    
+    # Create a function to run in the background
+    def background_query_task(query, mode):
+        try:
+            result = rag.query(query, mode=mode)
+            background_jobs[job_id]['result'] = result
+            background_jobs[job_id]['status'] = 'completed'
+        except Exception as e:
+            background_jobs[job_id]['error'] = str(e)
+            background_jobs[job_id]['status'] = 'failed'
+        finally:
+            background_jobs[job_id]['end_time'] = time.time()
+    
+    # Submit the task to the executor
+    future = executor.submit(background_query_task, user_query, mode)
+    
+    # Store job information
+    background_jobs[job_id] = {
+        'id': job_id,
+        'query': user_query,
+        'mode': mode,
+        'status': 'running',
+        'start_time': time.time(),
+        'end_time': None,
+        'future': future,
+        'result': None,
+        'error': None
+    }
+    
+    return jsonify({
+        'job_id': job_id,
+        'status': 'running',
+        'query': user_query
+    })
+
+@app.route('/api/job_status/<job_id>', methods=['GET'])
+def job_status(job_id):
+    """Check the status of a background job."""
+    if job_id not in background_jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    job = background_jobs[job_id]
+    response = {
+        'job_id': job_id,
+        'status': job['status'],
+        'query': job['query'],
+        'start_time': job['start_time']
+    }
+    
+    if job['end_time']:
+        response['end_time'] = job['end_time']
+        response['duration'] = job['end_time'] - job['start_time']
+    
+    if job['status'] == 'completed':
+        response['result'] = job['result']
+    elif job['status'] == 'failed':
+        response['error'] = job['error']
+    
+    return jsonify(response)
+
+@app.route('/api/reset', methods=['POST'])
+def reset_database():
+    """API endpoint to reset the vector database."""
+    result = rag.reset_database()
+    return jsonify(result)
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """API endpoint to get system status."""
+    try:
+        db_stats = rag.vectordb.get_collection_stats()
+        
+        # Add performance metrics
+        perf_metrics = {
+            'device': rag.embedding_model.device,
+            'quantized': hasattr(rag.embedding_model, 'quantized') and rag.embedding_model.quantized,
+            'embedding_cache_size': _get_dir_size(config.get('embed_cache_dir')) if config.get('embed_cache_dir') else 0,
+            'response_cache_size': len(rag.response_cache) if hasattr(rag, 'response_cache') else 0,
+            'active_background_jobs': sum(1 for job in background_jobs.values() if job['status'] == 'running'),
+            'completed_jobs': sum(1 for job in background_jobs.values() if job['status'] in ('completed', 'failed'))
+        }
+        
+        return jsonify({
+            'status': 'ok',
+            'database': db_stats,
+            'ollama_host': config['ollama_host'],
+            'model_name': config['model_name'],
+            'quick_model': config['quick_model_name'],
+            'speed_model': config['speed_model_name'],
+            'performance': perf_metrics
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+def _get_dir_size(directory):
+    """Get the size of a directory in bytes."""
+    if not directory or not os.path.exists(directory):
+        return 0
+    
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(directory):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            total_size += os.path.getsize(fp)
+    
+    return total_size
+
+@app.route('/api/ai_extract', methods=['POST'])
+def ai_extract():
+    """API endpoint for AI-powered structured/semantic extraction using Diffbot or OpenAI."""
+    data = request.json
+    url = data.get('url')
+    provider = data.get('provider', 'diffbot')
+    token = os.getenv('DIFFBOT_TOKEN') or data.get('token')
+    openai_key = os.getenv('OPENAI_API_KEY') or data.get('openai_key')
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
+    if provider == 'openai':
+        # Use OpenAI to extract structured data from scraped content
+        # For demo, fetch content with requests and BeautifulSoup
+        import requests
+        from bs4 import BeautifulSoup
+        try:
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            text = soup.get_text(separator=' ')
+        except Exception as e:
+            return jsonify({'error': f'Failed to fetch or parse page: {e}'}), 500
+        if not openai_key:
+            return jsonify({'error': 'OpenAI API key is required'}), 400
+        store_chat_message('user', f'[AI Extract][OpenAI] {url}')
+        result = extract_with_openai(text, openai_key)
+        store_chat_message('bot', result or '[OpenAI extraction failed]')
+        if result is None:
+            return jsonify({'error': 'OpenAI extraction failed'}), 500
+        return jsonify({'provider': 'openai', 'result': result})
+    # Default: Diffbot
+    if not token:
+        return jsonify({'error': 'Diffbot API token is required'}), 400
+    store_chat_message('user', f'[AI Extract][Diffbot] {url}')
+    result = extract_with_diffbot(url, token)
+    store_chat_message('bot', result or '[Diffbot extraction failed]')
+    if result is None:
+        return jsonify({'error': 'Diffbot extraction failed'}), 500
+    return jsonify({'provider': 'diffbot', 'result': result})
+
+@app.route('/api/ollama_deepseek', methods=['POST'])
+def ollama_deepseek():
+    data = request.get_json()
+    prompt = data.get('prompt', '')
+    if not prompt:
+        return jsonify({'error': 'Prompt is required.'}), 400
+    
+    # Start a background job for processing
+    job_id = f"deepseek_{int(time.time())}_{hash(prompt) % 10000}"
+    
+    def deepseek_task():
+        try:
+            # Retrieve relevant context from scraped content (RAG)
+            rag_result = rag.query(prompt, n_results=3, temperature=0.3, max_tokens=256, mode="deep")
+            context_docs = rag_result.get('contexts', [])
+            context_str = ''
+            for i, doc in enumerate(context_docs):
+                title = doc.get('title', '')
+                source = doc.get('source', '')
+                text = doc.get('text', '')
+                context_str += f"[Doc {i+1}] Title: {title}\nSource: {source}\n{text}\n\n"
+            
+            # Build prompt with context
+            full_prompt = f"Context information from website:\n{context_str}\nUser question: {prompt}\n\nPlease answer based only on the above context. If the answer is not present, say you don't know."
+            
+            # Call local Ollama DeepSeek model
+            ollama_url = 'http://localhost:11434/api/generate'
+            payload = {
+                'model': 'deepseek-r1:1.5b',
+                'prompt': full_prompt,
+                'stream': False,
+                'options': {
+                    'num_thread': config['num_thread']
+                }
+            }
+            resp = requests.post(ollama_url, json=payload, timeout=60)
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                background_jobs[job_id]['result'] = result.get('response', '').strip()
+                background_jobs[job_id]['status'] = 'completed'
+            else:
+                background_jobs[job_id]['error'] = f'Ollama error: {resp.status_code} {resp.text}'
+                background_jobs[job_id]['status'] = 'failed'
+        except Exception as e:
+            background_jobs[job_id]['error'] = f'Ollama exception: {e}'
+            background_jobs[job_id]['status'] = 'failed'
+        finally:
+            background_jobs[job_id]['end_time'] = time.time()
+    
+    # Submit the task
+    background_jobs[job_id] = {
+        'id': job_id,
+        'prompt': prompt,
+        'status': 'running',
+        'start_time': time.time(),
+        'end_time': None,
+        'result': None,
+        'error': None
+    }
+    
+    executor.submit(deepseek_task)
+    
+    return jsonify({
+        'job_id': job_id,
+        'status': 'running'
+    })
+
+@app.route('/api/chat_history', methods=['GET'])
+def get_chat_history():
+    """API endpoint to get chat history."""
+    return jsonify({'history': chat_history})
+
+@app.route('/view_chunks')
+def view_chunks():
+    """View all stored text chunks from the vector database."""
+    try:
+        # Get all stored documents (chunks)
+        # We use rag.vectordb.collection to access the ChromaDB collection directly
+        # ChromaDB's API: collection.get() returns all documents if no filters are given
+        results = rag.vectordb.collection.get()
+        
+        chunks = []
+        for i, (id, metadata, content) in enumerate(zip(results['ids'], results['metadatas'], results['documents'])):
+            chunks.append({
+                'id': id,
+                'metadata': metadata,
+                'content': content
+            })
+        
+        return render_template('chunks.html', chunks=chunks)
+    except Exception as e:
+        return f"Error retrieving chunks: {str(e)}", 500
+
+@app.route('/warmup', methods=['POST'])
+def warmup_model():
+    """Warm up the models by running simple prompts."""
+    try:
+        # Start warming up in the background
+        def warmup_task():
+            # Warm up embedding model
+            _ = rag.embedding_model.get_embeddings(["This is a warmup text to initialize the embedding model."])
+            
+            # Warm up LLM models with short prompts
+            models = [
+                (rag.llm, "deep"),
+                (rag.quick_llm, "quick"),
+                (rag.speed_llm, "speed")
+            ]
+            
+            for model, name in models:
+                try:
+                    _ = model.answer_with_rag(
+                        "What is the current date?",
+                        [{"content": "This is a warmup text."}],
+                        temperature=0.1,
+                        max_tokens=10
+                    )
+                    print(f"Warmed up {name} model")
+                except Exception as e:
+                    print(f"Error warming up {name} model: {e}")
+            
+            print("Model warmup complete")
+        
+        # Execute in background
+        executor.submit(warmup_task)
+        
+        return jsonify({"status": "Warmup started in background"})
+    except Exception as e:
+        return jsonify({"error": f"Failed to start warmup: {str(e)}"}), 500
+
+# Create embedding cache directory if it doesn't exist
+if config['embed_cache_dir'] and not os.path.exists(config['embed_cache_dir']):
+    os.makedirs(config['embed_cache_dir'])
+
+# Warm up the models on startup
+with app.app_context():
+    executor.submit(lambda: app.route('/warmup', methods=['POST'])(warmup_model)())
+
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5000)

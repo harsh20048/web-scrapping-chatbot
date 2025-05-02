@@ -1,0 +1,18 @@
+beautifulsoup4==4.12.2
+requests
+flask==2.3.3
+sentence-transformers==2.2.2
+chromadb==0.4.18
+ollama==0.1.5
+urllib3==2.0.7
+tqdm==4.66.1
+lxml==4.9.3
+validators==0.22.0
+python-dotenv==1.0.0
+selenium==4.19.0
+# Optional: Add playwright if you want to use it instead of selenium
+# playwright==1.42.0
+# For AI-powered extraction (Diffbot API or Crawl4AI)
+# There is no official diffbot SDK, use requests for API calls
+streamlit==1.31.0
+pandas==2.1.4

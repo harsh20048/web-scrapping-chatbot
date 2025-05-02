@@ -1,0 +1,240 @@
+"""
+RAG (Retrieval-Augmented Generation) module.
+Combines web scraping, embeddings, vector database, and LLM for question answering.
+"""
+
+from typing import Dict, Any, List
+import os
+from .scraper import WebScraper
+from .processor import TextProcessor
+from .embeddings import EmbeddingModel
+from .vectordb import VectorDB
+from .ollama_client import OllamaClient
+from .gemini_client import GeminiClient
+
+
+class RAG:
+    def __init__(self, base_url=None, config=None):
+        """
+        Initialize the RAG system.
+        
+        Args:
+            base_url (str, optional): Base URL for web scraping
+            config (Dict, optional): Configuration parameters
+        """
+        self.config = config or {}
+        self.base_url = base_url
+        
+        # Default configuration
+        self.scraper_config = {
+            'delay': self.config.get('scrape_delay', 1),  # Reduced delay
+            'max_pages': self.config.get('max_pages', 50)  # Reduced max pages
+        }
+        
+        self.processor_config = {
+            'chunk_size': self.config.get('chunk_size', 300),  # Smaller chunks
+            'chunk_overlap': self.config.get('chunk_overlap', 30)  # Reduced overlap
+        }
+        
+        self.embedding_model_name = self.config.get('embedding_model', 'all-MiniLM-L6-v2')
+        
+        self.vectordb_config = {
+            'persist_directory': self.config.get('persist_directory', './data/chroma'),
+            'collection_name': self.config.get('collection_name', 'website_content')
+        }
+        
+        # Model names from Ollama list
+        self.ollama_config = {
+            'host': self.config.get('ollama_host', 'http://localhost:11434'),
+            'model': self.config.get('model_name', 'phi:latest')
+        }
+        
+        # --- Additional LLMs for modes ---
+        self.quick_model_name = self.config.get('quick_model_name', os.getenv('QUICK_MODEL_NAME', 'llama3.2:3b-instruct-q3_K_M'))
+        self.speed_model_name = self.config.get('speed_model_name', os.getenv('SPEED_MODEL_NAME', 'tinyllama:latest'))
+        self.deep_model_name = self.config.get('deep_model_name', os.getenv('DEEP_MODEL_NAME', 'mistral:7b'))
+        
+        # Initialize components as needed
+        self.processor = TextProcessor(
+            chunk_size=self.processor_config['chunk_size'],
+            chunk_overlap=self.processor_config['chunk_overlap']
+        )
+        
+        self.embedding_model = EmbeddingModel(model_name=self.embedding_model_name)
+        
+        self.vectordb = VectorDB(
+            persist_directory=self.vectordb_config['persist_directory'],
+            collection_name=self.vectordb_config['collection_name']
+        )
+        
+        self.llm = OllamaClient(
+            host=self.ollama_config['host'],
+            model=self.deep_model_name
+        )
+        
+        self.quick_llm = OllamaClient(
+            host=self.ollama_config['host'],
+            model=self.quick_model_name
+        )
+        
+        self.speed_llm = OllamaClient(
+            host=self.ollama_config['host'],
+            model=self.speed_model_name
+        )
+        
+        # Initialize Gemini client for quick mode
+        self.gemini_api_key = self.config.get('gemini_api_key', os.getenv('GEMINI_API_KEY'))
+        self.gemini_client = None
+        if self.gemini_api_key:
+            self.gemini_client = GeminiClient(api_key=self.gemini_api_key)
+    
+    def scrape_website(self, url=None):
+        """
+        Scrape a website and process its content.
+        
+        Args:
+            url (str, optional): URL to scrape, uses base_url if not provided
+            
+        Returns:
+            int: Number of documents added to the vector database
+        """
+        import traceback
+        target_url = url or self.base_url
+        if not target_url:
+            raise ValueError("No URL provided for scraping")
+        
+        print(f"Starting website scraping process for {target_url}")
+        
+        try:
+            # Initialize the scraper
+            scraper = WebScraper(
+                base_url=target_url,
+                delay=self.scraper_config['delay'],
+                max_pages=self.scraper_config['max_pages']
+            )
+            
+            # Scrape the website
+            pages_content = scraper.scrape()
+            print(f"[DEBUG] Scraper returned {len(pages_content)} pages with content")
+            if len(pages_content) == 0:
+                print("[DEBUG] No pages with content were scraped. Aborting pipeline.")
+                return 0
+            
+            # Process the scraped content
+            print("Processing scraped content...")
+            documents = self.processor.process_all_pages(pages_content)
+            print(f"[DEBUG] Processor returned {len(documents)} chunks")
+            if len(documents) == 0:
+                print("[DEBUG] No chunks generated from scraped content. Aborting pipeline.")
+                return 0
+            
+            # Generate embeddings
+            print("Generating embeddings...")
+            embedded_documents = self.embedding_model.embed_documents(documents)
+            print(f"[DEBUG] Embedded {len(embedded_documents)} chunks")
+            if len(embedded_documents) == 0:
+                print("[DEBUG] No embeddings generated. Aborting pipeline.")
+                return 0
+            
+            # Store in vector database
+            print("Storing in vector database...")
+            self.vectordb.add_documents(embedded_documents)
+            print(f"Scraping and processing complete. Added {len(embedded_documents)} documents to the vector database.")
+            return len(embedded_documents)
+        except Exception as e:
+            print(f"[ERROR] scrape_website failed: {e}")
+            traceback.print_exc()
+            return 0
+    
+    def query(self, user_query, n_results=1, temperature=0.3, max_tokens=128, mode="speed"):  # Default to speed mode
+        """
+        Answer a user query using the RAG system, supporting quick, speed, and deep analysis modes.
+        Args:
+            user_query (str): User's question
+            n_results (int): Number of results to retrieve
+            temperature (float): LLM temperature parameter
+            max_tokens (int): Maximum tokens for LLM response
+            mode (str): "quick", "speed", or "deep"
+        Returns:
+            Dict: Contains answer and retrieved contexts
+        """
+        import time
+        print(f"Processing query: {user_query} [mode={mode}]")
+        try:
+            t0 = time.time()
+            # Set mode-specific parameters
+            if mode == "quick":
+                n_results = 2
+                temperature = 0.3
+                max_tokens = 256
+            elif mode == "speed":
+                n_results = 1
+                temperature = 0.2
+                max_tokens = 128
+            elif mode == "deep":
+                n_results = 4  # Reduced from 8 to 4 for better performance
+                temperature = 0.5
+                max_tokens = 512  # Reduced from 1024 to 512
+            # Generate query embedding
+            query_embedding = self.embedding_model.embed_query(user_query)
+            print(f"[DEBUG] Query embedding shape: {query_embedding.shape if hasattr(query_embedding, 'shape') else type(query_embedding)}")
+            # Retrieve relevant documents
+            retrieved_docs = self.vectordb.query(query_embedding, n_results=n_results)
+            print(f"[DEBUG] Retrieved {len(retrieved_docs)} docs from vector DB")
+            if not retrieved_docs:
+                print("[DEBUG] No relevant documents found for query.")
+                return {
+                    "answer": "I don't have enough information from the website content to answer your question about this topic.",
+                    "contexts": []
+                }
+            # Generate answer using selected LLM
+            print(f"[DEBUG] Calling LLM with RAG context... [mode={mode}]")
+            t_llm_start = time.time()
+            if mode == "quick":
+                answer = self.quick_llm.answer_with_rag(user_query, retrieved_docs, temperature=temperature, max_tokens=max_tokens)
+            elif mode == "speed":
+                answer = self.speed_llm.answer_with_rag(user_query, retrieved_docs, temperature=temperature, max_tokens=max_tokens)
+            else:
+                answer = self.llm.answer_with_rag(user_query, retrieved_docs, temperature=temperature, max_tokens=max_tokens)
+            t_llm_end = time.time()
+            print(f"[DEBUG] LLM answer: {answer[:200]}...")
+            print(f"[DEBUG] LLM response time: {t_llm_end - t_llm_start:.2f}s")
+            # Format contexts for response
+            contexts = []
+            for doc in retrieved_docs:
+                contexts.append({
+                    "text": doc['content'],
+                    "source": doc['metadata'].get('source', ''),
+                    "title": doc['metadata'].get('title', '')
+                })
+            print(f"[DEBUG] Total query time: {time.time() - t0:.2f}s")
+            return {
+                "answer": answer,
+                "contexts": contexts
+            }
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] query failed: {e}")
+            traceback.print_exc()
+            return {
+                "answer": "I'm having trouble processing your question. Please try again or try a different question about the website content.",
+                "contexts": []
+            }
+    
+    def reset_database(self):
+        """Reset the vector database."""
+        self.vectordb.reset_collection()
+        return {"status": "success", "message": "Vector database reset successfully"}
+
+
+if __name__ == "__main__":
+    # Example usage
+    rag = RAG(base_url="https://example.com")
+    
+    # Scrape website (uncomment to run)
+    # rag.scrape_website()
+    
+    # Example query
+    result = rag.query("What services do you offer?")
+    print(f"Answer: {result['answer']}")
+    print(f"Based on {len(result['contexts'])} context documents")
