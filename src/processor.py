@@ -5,6 +5,8 @@ This module prepares scraped content for embedding and retrieval.
 
 import re
 from typing import List, Dict, Any
+import nltk
+from nltk.tokenize import sent_tokenize
 
 
 class TextProcessor:
@@ -48,43 +50,50 @@ class TextProcessor:
     
     def chunk_text(self, text: str) -> List[str]:
         """
-        Split text into coherent chunks: first by paragraphs, then by sentences, then by fixed size if needed.
+        Split text into coherent chunks using dynamic chunking: paragraphs, then sentences (using NLTK), then fixed size if needed.
         Args:
             text (str): Text to split into chunks
         Returns:
             List[str]: List of text chunks
         """
-        import re
+        # Ensure NLTK punkt is available
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+
         # If text is shorter than chunk_size, return it as a single chunk
         if len(text) < self.chunk_size:
             return [text]
 
-        # Guard against excessively large pages
         MAX_TEXT_LENGTH = 100_000
         MAX_CHUNKS = 200
         if len(text) > MAX_TEXT_LENGTH:
             print(f"[WARNING] Skipping page: cleaned text too large (length={len(text)})")
             return []
 
-        # Step 1: Split by paragraph (two or more newlines)
+        # Step 1: Split by paragraph
         paragraphs = re.split(r'\n\s*\n', text)
         chunks = []
         for para in paragraphs:
             para = para.strip()
             if not para:
                 continue
-            # Step 2: If paragraph is too long, split by sentence boundaries
+            # Step 2: If paragraph is too long, split by sentence boundaries (NLTK)
             if len(para) > self.chunk_size:
-                # Split by sentence (using punctuation)
-                sentences = re.split(r'(?<=[.!?]) +', para)
+                sentences = sent_tokenize(para)
                 current_chunk = ''
+                current_length = 0
                 for sentence in sentences:
-                    if len(current_chunk) + len(sentence) + 1 <= self.chunk_size:
+                    sentence_length = len(sentence.split())
+                    if current_length + sentence_length <= self.chunk_size:
                         current_chunk += (' ' if current_chunk else '') + sentence
+                        current_length += sentence_length
                     else:
                         if current_chunk:
                             chunks.append(current_chunk.strip())
                         current_chunk = sentence
+                        current_length = sentence_length
                 if current_chunk:
                     chunks.append(current_chunk.strip())
             else:
@@ -93,14 +102,14 @@ class TextProcessor:
         # Step 3: If any chunk is still too long, split by fixed size
         final_chunks = []
         for chunk in chunks:
-            if len(chunk) <= self.chunk_size:
+            if len(chunk.split()) <= self.chunk_size:
                 final_chunks.append(chunk)
             else:
-                # Split by fixed size with overlap
+                words = chunk.split()
                 start = 0
-                while start < len(chunk):
-                    end = min(start + self.chunk_size, len(chunk))
-                    final_chunks.append(chunk[start:end])
+                while start < len(words):
+                    end = min(start + self.chunk_size, len(words))
+                    final_chunks.append(' '.join(words[start:end]))
                     start = end - self.chunk_overlap if (end - self.chunk_overlap > start) else end
 
         # Limit to MAX_CHUNKS
@@ -111,27 +120,31 @@ class TextProcessor:
     
     def process_page(self, page_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Process a page by cleaning and chunking its content.
+        Process a page by cleaning and chunking its content, and enrich metadata if available.
         
         Args:
-            page_data (Dict): Page data including content, title, and URL
-            
+            page_data (Dict): Page data including content, title, and URL, and optionally section_heading, page_hierarchy, keywords
         Returns:
-            List[Dict]: List of document chunks with metadata
+            List[Dict]: List of document chunks with enriched metadata
         """
         cleaned_text = self.clean_text(page_data['content'])
         chunks = self.chunk_text(cleaned_text)
         
         documents = []
         for i, chunk in enumerate(chunks):
+            metadata = {
+                'source': page_data['url'],
+                'title': page_data['title'],
+                'chunk_id': i,
+                'total_chunks': len(chunks)
+            }
+            # Add enriched metadata if present
+            for key in ['section_heading', 'page_hierarchy', 'keywords']:
+                if key in page_data:
+                    metadata[key] = page_data[key]
             doc = {
                 'content': chunk,
-                'metadata': {
-                    'source': page_data['url'],
-                    'title': page_data['title'],
-                    'chunk_id': i,
-                    'total_chunks': len(chunks)
-                }
+                'metadata': metadata
             }
             documents.append(doc)
         
@@ -139,20 +152,17 @@ class TextProcessor:
     
     def process_all_pages(self, pages_content: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Process all scraped pages.
+        Process all scraped pages, passing through enriched metadata if available.
         
         Args:
             pages_content (Dict): Dictionary of scraped pages
-            
         Returns:
-            List[Dict]: List of all document chunks with metadata
+            List[Dict]: List of all document chunks with enriched metadata
         """
         all_documents = []
-        
         for url, page_data in pages_content.items():
             page_documents = self.process_page(page_data)
             all_documents.extend(page_documents)
-        
         return all_documents
 
 

@@ -16,3 +16,4 @@ selenium==4.19.0
 # There is no official diffbot SDK, use requests for API calls
 streamlit==1.31.0
 pandas==2.1.4
+nltk==3.8.1

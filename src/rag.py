@@ -49,6 +49,22 @@ class RAG:
             'host': self.config.get('ollama_host', 'http://localhost:11434'),
             'model': self.config.get('model_name', 'phi:latest')
         }
+
+        # --- Prompt engineering: few-shot QA examples for Contisoft Techno ---
+        self.few_shot_examples = [
+            {
+                'q': 'What services does Contisoft Techno offer?',
+                'a': 'Contisoft Techno offers web development, mobile app development, and digital marketing services.'
+            },
+            {
+                'q': 'Where is Contisoft Techno located?',
+                'a': 'Contisoft Techno is located in Chennai, Tamil Nadu, India.'
+            },
+            {
+                'q': 'What is RenewalHelp?',
+                'a': 'RenewalHelp is a software product by Contisoft Techno for managing renewals and subscriptions.'
+            }
+        ]
         
         # --- Primary LLMs for modes ---
         self.quick_model_name = self.config.get('quick_model_name', os.getenv('QUICK_MODEL_NAME', 'llama3.2:3b-instruct-q3_K_M'))
@@ -455,46 +471,6 @@ WEBSITE CONTENT SAMPLES:
                         word_overlap = len(query_word_set.intersection(set(content.split())))
                         # Score for phrase matches (weighted higher)
                         phrase_score = sum(2 for phrase in query_phrases if phrase in content)
-                        # Combined score
-                        total_score = word_overlap + phrase_score
-                        
-                        # Boost score if title matches query keywords
-                        if 'title' in doc['metadata']:
-                            title = doc['metadata']['title'].lower()
-                            title_boost = len(query_word_set.intersection(set(title.split())))
-                            total_score += title_boost * 2  # Double weight for title matches
-                            
-                        scored.append((total_score, doc))
-                    scored.sort(reverse=True, key=lambda x: x[0])
-                    keyword_docs = [doc for score, doc in scored[:n_keyword] if score > 0]
-                
-                # Merge and deduplicate
-                doc_ids = set()
-                merged_docs = []
-                # Add semantic search results first (they're often better quality)
-                for doc in semantic_docs:
-                    doc_id = (doc['metadata'].get('source', ''), doc['metadata'].get('chunk_id', -1))
-                    if doc_id not in doc_ids:
-                        merged_docs.append(doc)
-                        doc_ids.add(doc_id)
-                # Then add keyword search results
-                for doc in keyword_docs:
-                    doc_id = (doc['metadata'].get('source', ''), doc['metadata'].get('chunk_id', -1))
-                    if doc_id not in doc_ids:
-                        merged_docs.append(doc)
-                        doc_ids.add(doc_id)
-                        
-                # Advanced reranking with multiple factors
-                reranked_docs = []
-                for doc in merged_docs:
-                    content = doc['content'].lower()
-                    # Base score: keyword overlap
-                    keyword_score = len(query_word_set.intersection(set(content.split())))
-                    # Phrase match score
-                    phrase_score = sum(2 for phrase in query_phrases if phrase in content)
-                    # Context length score (favor medium-length contexts)
-                    length = len(content.split())
-                    length_score = 1.0 if 50 <= length <= 200 else 0.5
                     # Title match score
                     title_score = 0
                     if 'title' in doc['metadata']:

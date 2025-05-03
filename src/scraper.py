@@ -109,10 +109,28 @@ class WebScraper:
                     homepage_debugged = True
                 
                 if len(content) > 50:  # Lowered threshold for storing
+                    # --- Metadata enrichment ---
+                    section_heading = None
+                    page_hierarchy = [title] if title else []
+                    # Try to extract the first h1/h2/h3 as section heading
+                    for tag in ['h1', 'h2', 'h3']:
+                        heading = soup.find(tag)
+                        if heading:
+                            section_heading = heading.get_text(strip=True)
+                            break
+                    # Simple keyword extraction: top 5 frequent words (excluding stopwords)
+                    from collections import Counter
+                    import re
+                    stopwords = set(['the', 'and', 'for', 'are', 'with', 'that', 'this', 'you', 'your', 'from', 'have', 'has', 'was', 'but', 'not', 'all', 'can', 'will', 'they', 'their', 'our', 'about', 'more', 'who', 'when', 'where', 'how', 'what', 'which', 'also', 'use', 'used', 'using', 'into', 'than', 'other', 'any', 'each', 'such', 'its', 'may', 'one', 'two', 'three', 'four', 'five'])
+                    words = re.findall(r'\b\w+\b', content.lower())
+                    keywords = [w for w, c in Counter(words).most_common(20) if w not in stopwords][:5]
                     self.pages_content[current_url] = {
                         'title': title,
                         'content': content,
-                        'url': current_url
+                        'url': current_url,
+                        'section_heading': section_heading,
+                        'page_hierarchy': page_hierarchy,
+                        'keywords': keywords
                     }
                 else:
                     print(f"[DEBUG] Skipped storing content for {current_url} (content too short)")
