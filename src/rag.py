@@ -447,49 +447,64 @@ WEBSITE CONTENT SAMPLES:
             
             # --- Hybrid Retrieval for Flash mode ---
             if mode == "flash":
-                n_semantic = 10  # Increased from 7
-                n_keyword = 8    # Increased from 5
-                n_results = 15   # Increased from 12
-                # Vector search (semantic)
+                n_semantic = 10  # semantic results
+                n_results = 15  # final number of docs to feed LLM
+
+                # 1. Semantic search (vector DB)
                 semantic_docs = self.vectordb.query(query_embedding, n_results=n_semantic)
-                
-                # Extract phrases for better matching
-                query_words = user_query.lower().split()
-                query_phrases = []
-                for i in range(len(query_words) - 1):
-                    query_phrases.append(f"{query_words[i]} {query_words[i+1]}")
-                
-                # Keyword search with phrase matching
-                all_docs = self.vectordb.get_all_documents() if hasattr(self.vectordb, 'get_all_documents') else []
-                keyword_docs = []
-                if all_docs:
-                    query_word_set = set(query_words)
-                    scored = []
-                    for doc in all_docs:
-                        content = doc['content'].lower()
-                        # Score for keyword matches
-                        word_overlap = len(query_word_set.intersection(set(content.split())))
-                        # Score for phrase matches (weighted higher)
-                        phrase_score = sum(2 for phrase in query_phrases if phrase in content)
-                    # Title match score
-                    title_score = 0
-                    if 'title' in doc['metadata']:
-                        title = doc['metadata']['title'].lower()
-                        title_score = len(query_word_set.intersection(set(title.split()))) * 2
-                    
-                    total_score = keyword_score + phrase_score + title_score + length_score
-                    reranked_docs.append((total_score, doc))
-                    
-                reranked_docs.sort(reverse=True, key=lambda x: x[0])
-                retrieved_docs = [doc for score, doc in reranked_docs[:n_results]]
+
+                # 2. Keyword / phrase search over *all* documents
+                query_words   = user_query.lower().split()
+                query_phrases = [" ".join(query_words[i:i+2]) for i in range(len(query_words)-1)]
+                query_word_set = set(query_words)
+
+                # Start the reranking list with the semantic results.  Give them a high
+                # base-score so they are preferred when relevance is comparable.
+                reranked_docs: List[Tuple[float, Dict[str, Any]]] = [(100.0, doc) for doc in semantic_docs]
+
+                all_docs = self.vectordb.get_all_documents() if hasattr(self.vectordb, "get_all_documents") else []
+                for doc in all_docs:
+                    # Skip docs already included from the semantic search
+                    if doc in semantic_docs:
+                        continue
+
+                    content_lower = doc["content"].lower()
+
+                    # --- Scoring heuristics ----------------------------------------------------
+                    keyword_score = len(query_word_set.intersection(set(content_lower.split())))               # 1 pt / keyword
+                    phrase_score  = sum(2 for phrase in query_phrases if phrase in content_lower)              # 2 pt / 2-gram match
+                    title_score   = 0
+                    if isinstance(doc.get("metadata"), dict) and doc["metadata"].get("title"):
+                        title_lower  = doc["metadata"]["title"].lower()
+                        title_score = len(query_word_set.intersection(set(title_lower.split()))) * 2          # 2 pt / keyword in title
+                    length_score  = min(len(content_lower.split()) // 150, 3)                                  # favour richer docs
+                    total_score   = keyword_score + phrase_score + title_score + length_score
+                    if total_score > 0:
+                        reranked_docs.append((total_score, doc))
+
+                # 3. Sort by score (desc) and de-duplicate w.r.t. source+chunk_id
+                reranked_docs.sort(key=lambda x: x[0], reverse=True)
+                retrieved_docs = []
+                seen_ids = set()
+                for score, doc in reranked_docs:
+                    meta = doc.get("metadata", {}) if isinstance(doc, dict) else {}
+                    unique_id = f"{meta.get('source','')}#{meta.get('chunk_id', -1)}"
+                    if unique_id in seen_ids:
+                        continue
+                    retrieved_docs.append(doc)
+                    seen_ids.add(unique_id)
+                    if len(retrieved_docs) >= n_results:
+                        break
+
                 print(f"[DEBUG] Enhanced hybrid retrieval: {len(retrieved_docs)} docs (semantic+keyword+phrase, advanced reranking)")
-                
+
                 if not retrieved_docs:
                     print("[DEBUG] No relevant documents found for query.")
                     return {
                         "answer": "I couldn't find any relevant information about that in the website content. Could you try asking a different question related to the website you scraped?",
                         "contexts": []
                     }
+
                 # Prepare the prompt with context and query
                 context_text = "\n\n".join([doc['content'] for doc in retrieved_docs])
             else:
