@@ -13,6 +13,12 @@ from .vectordb import VectorDB
 from .ollama_client import OllamaClient
 from .gemini_client import GeminiClient
 
+# Optional cross-encoder for reranking
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:  # Fallback when package is not installed
+    CrossEncoder = None
+
 
 class RAG:
     def __init__(self, base_url=None, config=None):
@@ -160,6 +166,17 @@ class RAG:
             r'.*about.*website',
             r'.*about.*site'
         ]
+        
+        # Lightweight cross-encoder re-ranker (improves Flash accuracy)
+        self.re_ranker = None
+        if CrossEncoder is not None:
+            try:
+                # MiniLM model is ~120 MB and fast enough for Flash mode
+                self.re_ranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+                print('[INFO] Cross-encoder re-ranker initialised for Flash mode.')
+            except Exception as _e:
+                print(f'[WARNING] Could not load cross-encoder model: {_e}')
+                self.re_ranker = None
     
     def is_greeting(self, query):
         """Check if the query is a greeting."""
@@ -497,6 +514,21 @@ WEBSITE CONTENT SAMPLES:
                         break
 
                 print(f"[DEBUG] Enhanced hybrid retrieval: {len(retrieved_docs)} docs (semantic+keyword+phrase, advanced reranking)")
+
+                # ---------------- Cross-encoder re-ranking -------------------
+                if self.re_ranker and retrieved_docs:
+                    try:
+                        pairs   = [(user_query, doc['content'][:512]) for doc in retrieved_docs]
+                        ce_scores = self.re_ranker.predict(pairs)
+                        # combine with previous score by simple addition (ce is 0-5 scale)
+                        for i, score in enumerate(ce_scores):
+                            # add small weight so semantic still matters
+                            retrieved_docs[i]['_ce_score'] = float(score)
+                        retrieved_docs.sort(key=lambda d: d.get('_ce_score', 0), reverse=True)
+                        retrieved_docs = retrieved_docs[:n_results]
+                        print(f"[DEBUG] Cross-encoder reranked top {len(retrieved_docs)} docs")
+                    except Exception as _e:
+                        print(f"[WARNING] Cross-encoder reranking failed: {_e}")
 
                 if not retrieved_docs:
                     print("[DEBUG] No relevant documents found for query.")
