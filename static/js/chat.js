@@ -13,7 +13,6 @@ const ollamaStatus = document.getElementById('ollama-status');
 const copyEmbedButton = document.getElementById('copy-embed');
 const embedUrl = document.getElementById('embed-url');
 const modeFlashBtn = document.getElementById('mode-flash');
-const modeDeepAnalysisBtn = document.getElementById('mode-deep-analysis');
 const modeDeepBtn = document.getElementById('mode-deep');
 const modeDeepseekBtn = document.getElementById('mode-deepseek');
 // History related elements are now handled directly in the HTML
@@ -51,7 +50,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // --- Mode selection logic ---
 let chatMode = 'flash';
 
-const modeBtns = [modeFlashBtn, modeDeepAnalysisBtn, modeDeepBtn, modeDeepseekBtn];
+const modeBtns = [modeFlashBtn, modeDeepBtn, modeDeepseekBtn];
 
 if (modeBtns.every(btn => btn)) {
     modeBtns.forEach(btn => {
@@ -361,13 +360,7 @@ function sendMessage() {
     let apiEndpoint;
     let requestData;
     
-    if (chatMode === 'deep-analysis') {
-        // Deep analysis mode - uses different endpoint
-        apiEndpoint = '/api/ollama_deepseek';
-        requestData = {
-            prompt: message
-        };
-    } else if (chatMode === 'deepseek') {
+    if (chatMode === 'deepseek') {
         // DeepSeek code mode
         apiEndpoint = '/api/query';
         requestData = {
@@ -414,11 +407,7 @@ function sendMessage() {
         chatMessages.removeChild(botTypingIndicator);
         
         // Process response based on mode and endpoint
-        if (chatMode === 'deep-analysis' && data.result) {
-            // For deep analysis, the response is in data.result
-            addBotMessage(data.result);
-            saveToHistory(message, data.result);
-        } else if (data.answer) {
+        if (data.answer) {
             // For standard modes, the response is in data.answer
             addBotMessage(data.answer);
             
@@ -447,19 +436,23 @@ function sendMessage() {
             console.log('Request was aborted');
         } else {
             console.error('Error:', error);
-            chatMessages.removeChild(botTypingIndicator);
-            showStopButton(false);
+            
+            // Remove typing indicator
+            if (botTypingIndicator.parentNode === chatMessages) {
+                chatMessages.removeChild(botTypingIndicator);
+            }
+            
+            // Show error message
             addSystemMessage(`Error: ${error.message}`);
         }
-    })
-    .finally(() => {
-        // Reset controller
-        currentController = null;
         
         // Re-enable input
         chatInput.disabled = false;
         sendButton.disabled = false;
         chatInput.focus();
+        
+        // Hide stop button
+        showStopButton(false);
     });
 }
 

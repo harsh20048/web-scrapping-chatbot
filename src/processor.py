@@ -48,14 +48,13 @@ class TextProcessor:
     
     def chunk_text(self, text: str) -> List[str]:
         """
-        Split text into chunks with overlap.
-        
+        Split text into coherent chunks: first by paragraphs, then by sentences, then by fixed size if needed.
         Args:
             text (str): Text to split into chunks
-            
         Returns:
             List[str]: List of text chunks
         """
+        import re
         # If text is shorter than chunk_size, return it as a single chunk
         if len(text) < self.chunk_size:
             return [text]
@@ -67,57 +66,48 @@ class TextProcessor:
             print(f"[WARNING] Skipping page: cleaned text too large (length={len(text)})")
             return []
 
+        # Step 1: Split by paragraph (two or more newlines)
+        paragraphs = re.split(r'\n\s*\n', text)
         chunks = []
-        start = 0
-        chunk_count = 0
-        while start < len(text):
-            end = start + self.chunk_size
-
-            # If we're not at the end of the text, try to find a natural break point
-            if end < len(text):
-                punctuation_positions = [
-                    pos for pos in [
-                        text.rfind('. ', start, end),
-                        text.rfind('? ', start, end),
-                        text.rfind('! ', start, end),
-                        text.rfind('\n', start, end)
-                    ] if pos != -1
-                ]
-                if punctuation_positions:
-                    break_point = max(punctuation_positions) + 2
-                    chunk = text[start:break_point].strip()
-                else:
-                    space_position = text.rfind(' ', start, end)
-                    if space_position != -1:
-                        break_point = space_position + 1
-                        chunk = text[start:break_point].strip()
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            # Step 2: If paragraph is too long, split by sentence boundaries
+            if len(para) > self.chunk_size:
+                # Split by sentence (using punctuation)
+                sentences = re.split(r'(?<=[.!?]) +', para)
+                current_chunk = ''
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) + 1 <= self.chunk_size:
+                        current_chunk += (' ' if current_chunk else '') + sentence
                     else:
-                        break_point = end
-                        chunk = text[start:break_point].strip()
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = sentence
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
             else:
-                break_point = len(text)
-                chunk = text[start:break_point].strip()
+                chunks.append(para)
 
-            # Add the chunk to our list
-            if chunk:
-                chunks.append(chunk)
-                chunk_count += 1
+        # Step 3: If any chunk is still too long, split by fixed size
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= self.chunk_size:
+                final_chunks.append(chunk)
             else:
-                print(f"[WARNING] Empty chunk encountered at start={start}, breaking loop.")
-                break
+                # Split by fixed size with overlap
+                start = 0
+                while start < len(chunk):
+                    end = min(start + self.chunk_size, len(chunk))
+                    final_chunks.append(chunk[start:end])
+                    start = end - self.chunk_overlap if (end - self.chunk_overlap > start) else end
 
-            # Move the starting position for the next chunk, accounting for overlap
-            next_start = break_point - self.chunk_overlap if end < len(text) else break_point
-            if next_start <= start or next_start >= len(text):
-                # Prevent infinite loop
-                break
-            start = next_start
-
-            if chunk_count >= MAX_CHUNKS:
-                print(f"[WARNING] Reached max chunk limit ({MAX_CHUNKS}) for this page. Truncating.")
-                break
-
-        return chunks
+        # Limit to MAX_CHUNKS
+        if len(final_chunks) > MAX_CHUNKS:
+            print(f"[WARNING] Reached max chunk limit ({MAX_CHUNKS}) for this page. Truncating.")
+            final_chunks = final_chunks[:MAX_CHUNKS]
+        return [c.strip() for c in final_chunks if c.strip()]
     
     def process_page(self, page_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """

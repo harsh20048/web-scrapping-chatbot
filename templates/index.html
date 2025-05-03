@@ -10,8 +10,8 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link rel="icon" type="image/png" href="https://cdn-icons-png.flaticon.com/512/4712/4712035.png">
     <style>
-      /* Simplified modal CSS directly in the HTML */
-      #history-popup {
+      /* Modal CSS for popups */
+      #history-popup, #scraped-data-popup {
         position: fixed;
         top: 0;
         left: 0;
@@ -24,22 +24,22 @@
         z-index: 9999;
       }
       
-      #history-popup.active {
+      #history-popup.active, #scraped-data-popup.active {
         display: flex;
       }
       
-      #history-popup-content {
+      #history-popup-content, #scraped-data-popup-content {
         background-color: white;
         padding: 20px;
         border-radius: 8px;
         width: 90%;
-        max-width: 600px;
+        max-width: 800px; /* Wider for scraped data */
         max-height: 80vh;
         overflow-y: auto;
         position: relative;
       }
       
-      #history-popup-close {
+      #history-popup-close, #scraped-data-popup-close {
         position: absolute;
         top: 10px;
         right: 10px;
@@ -55,24 +55,83 @@
         justify-content: center;
       }
       
-      #history-popup-close:hover {
+      #history-popup-close:hover, #scraped-data-popup-close:hover {
         background-color: #ced4da;
       }
       
-      #history-popup-list {
+      #history-popup-list, #scraped-data-popup-list {
         margin-top: 20px;
         max-height: 400px;
         overflow-y: auto;
       }
       
-      .history-item {
+      .history-item, .scraped-data-item {
         padding: 10px;
         border-bottom: 1px solid #e9ecef;
         font-size: 14px;
+        margin-bottom: 8px;
       }
       
       .history-item.user {
         background-color: rgba(67, 97, 238, 0.05);
+      }
+      
+      /* Scraped data specific styles */
+      .popup-actions {
+        display: flex;
+        gap: 10px;
+        margin: 15px 0;
+      }
+      
+      .search-input {
+        flex: 1;
+        padding: 8px 12px;
+        border: 1px solid #ced4da;
+        border-radius: 4px;
+      }
+      
+      .view-type-select {
+        padding: 8px 12px;
+        border: 1px solid #ced4da;
+        border-radius: 4px;
+        background-color: white;
+      }
+      
+      .scraped-data-item {
+        background-color: #f8f9fa;
+        border-radius: 4px;
+      }
+      
+      .scraped-data-item h4 {
+        margin: 0 0 8px 0;
+        color: #4361ee;
+      }
+      
+      .source-url {
+        font-size: 12px;
+        color: #6c757d;
+        margin-bottom: 8px;
+        word-break: break-all;
+      }
+      
+      .content-preview {
+        margin-top: 8px;
+      }
+      
+      .highlight {
+        background-color: #ffeb3b;
+        padding: 0 2px;
+        border-radius: 2px;
+      }
+      
+      /* Style for the Train Flash button */
+      .mode-button.train-button {
+        background-color: #8854d0;
+        border: 1px solid #7048e8;
+      }
+      
+      .mode-button.train-button:hover {
+        background-color: #7048e8;
       }
     </style>
   </head>
@@ -114,6 +173,9 @@
             <button id="show-history-btn" class="secondary-button">
               <i class="fas fa-history"></i> History
             </button>
+            <button id="view-scraped-data" class="secondary-button">
+              <i class="fas fa-database"></i> View Web Scraping Data
+            </button>
           </div>
           
           <div id="system-status" class="status-info">
@@ -143,12 +205,9 @@
                 <button
                   id="mode-flash"
                   class="mode-button selected"
-                  title="llama3.2:1b-instruct-q2_K - Optimized for speed with good accuracy"
+                  title="phi3:3.8b-mini-4k-instruct-q4_K_M - High accuracy with good speed"
                 >
                   <i class="fas fa-bolt"></i> Flash
-                </button>
-                <button id="mode-deep-analysis" class="mode-button">
-                  <i class="fas fa-search-plus"></i> Deep Analysis
                 </button>
                 <button
                   id="mode-deep"
@@ -160,9 +219,16 @@
                 <button
                   id="mode-deepseek"
                   class="mode-button"
-                  title="codegemma:2b-code"
+                  title="deepseek-r1:1.5b - Optimized for code and technical content"
                 >
                   <i class="fas fa-code"></i> DeepSeek
+                </button>
+                <button
+                  id="train-flash-model"
+                  class="mode-button train-button"
+                  title="Generate training data from scraped content to improve Flash mode accuracy"
+                >
+                  <i class="fas fa-graduation-cap"></i> Train Flash
                 </button>
               </div>
             </div>
@@ -225,11 +291,27 @@
         <div id="history-popup-list"></div>
       </div>
     </div>
+    
+    <!-- Scraped Data Popup -->
+    <div id="scraped-data-popup">
+      <div id="scraped-data-popup-content">
+        <button id="scraped-data-popup-close"><i class="fas fa-times"></i></button>
+        <h3><i class="fas fa-database"></i> Web Scraping Data</h3>
+        <div class="popup-actions">
+          <input type="text" id="scraped-data-search" placeholder="Search in scraped data..." class="search-input">
+          <select id="scraped-data-view-type" class="view-type-select">
+            <option value="summary">Summary View</option>
+            <option value="detailed">Detailed View</option>
+          </select>
+        </div>
+        <div id="scraped-data-popup-list"></div>
+      </div>
+    </div>
 
     <!-- Main application script -->
     <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
     
-    <!-- Simple history popup script -->
+    <!-- Popup scripts -->
     <script>
       // Direct implementation of history popup functionality
       document.addEventListener('DOMContentLoaded', function() {
@@ -315,7 +397,372 @@
           if (event.key === 'Escape' && historyPopup.classList.contains('active')) {
             historyPopup.classList.remove('active');
           }
+          if (event.key === 'Escape' && scrapedDataPopup.classList.contains('active')) {
+            scrapedDataPopup.classList.remove('active');
+          }
         });
+        
+        // Scraped Data Popup Functionality
+        const viewScrapedDataBtn = document.getElementById('view-scraped-data');
+        const scrapedDataPopup = document.getElementById('scraped-data-popup');
+        const scrapedDataPopupClose = document.getElementById('scraped-data-popup-close');
+        const scrapedDataPopupList = document.getElementById('scraped-data-popup-list');
+        const scrapedDataSearch = document.getElementById('scraped-data-search');
+        const scrapedDataViewType = document.getElementById('scraped-data-view-type');
+        
+        // Show scraped data popup
+        viewScrapedDataBtn.addEventListener('click', function() {
+          fetchScrapedData();
+        });
+        
+        // Close scraped data popup
+        scrapedDataPopupClose.addEventListener('click', function() {
+          scrapedDataPopup.classList.remove('active');
+        });
+        
+        // Close when clicking outside the content
+        scrapedDataPopup.addEventListener('click', function(event) {
+          if (event.target === scrapedDataPopup) {
+            scrapedDataPopup.classList.remove('active');
+          }
+        });
+        
+        // Search functionality
+        scrapedDataSearch.addEventListener('input', function() {
+          const searchTerm = this.value.toLowerCase();
+          filterScrapedData(searchTerm);
+        });
+        
+        // View type change
+        scrapedDataViewType.addEventListener('change', function() {
+          fetchScrapedData();
+        });
+        
+        // Fetch scraped data from API
+        function fetchScrapedData() {
+          const viewType = scrapedDataViewType.value;
+          const searchTerm = scrapedDataSearch.value.toLowerCase();
+          
+          // Show loading indicator
+          scrapedDataPopupList.innerHTML = '<div class="scraped-data-item"><i class="fas fa-spinner fa-spin"></i> Loading scraped data...</div>';
+          scrapedDataPopup.classList.add('active');
+          
+          fetch(`/api/scraped_data?view_type=${viewType}`)
+            .then(response => response.json())
+            .then(data => {
+              displayScrapedData(data, searchTerm);
+            })
+            .catch(error => {
+              console.error('Error loading scraped data:', error);
+              scrapedDataPopupList.innerHTML = '<div class="scraped-data-item"><i class="fas fa-exclamation-triangle"></i> Failed to load scraped data. Please try again.</div>';
+            });
+        }
+        
+        // Display scraped data in the popup
+        function displayScrapedData(data, searchTerm = '') {
+          scrapedDataPopupList.innerHTML = '';
+          const viewType = scrapedDataViewType.value;
+          
+          if (!data.documents || data.documents.length === 0) {
+            scrapedDataPopupList.innerHTML = '<div class="scraped-data-item"><i class="fas fa-info-circle"></i> No scraped data found. Please scrape a website first.</div>';
+            return;
+          }
+          
+          // Group by source for summary view
+          if (viewType === 'summary') {
+            const sourceGroups = {};
+            
+            data.documents.forEach(doc => {
+              const source = doc.metadata?.source || 'Unknown';
+              if (!sourceGroups[source]) {
+                sourceGroups[source] = [];
+              }
+              sourceGroups[source].push(doc);
+            });
+            
+            Object.entries(sourceGroups).forEach(([source, docs]) => {
+              if (searchTerm && !source.toLowerCase().includes(searchTerm) && 
+                  !docs.some(doc => doc.content?.toLowerCase().includes(searchTerm))) {
+                return; // Skip this source if it doesn't match search
+              }
+              
+              const div = document.createElement('div');
+              div.className = 'scraped-data-item';
+              
+              const title = docs[0].metadata?.title || 'No title';
+              const chunkCount = docs.length;
+              
+              let contentHTML = `<h4>${title}</h4>`;
+              contentHTML += `<div class="source-url"><i class="fas fa-link"></i> ${source}</div>`;
+              contentHTML += `<div><i class="fas fa-file-alt"></i> <strong>${chunkCount}</strong> content chunks</div>`;
+              
+              // Show a sample of the first chunk content
+              if (docs[0].content) {
+                let preview = docs[0].content.substring(0, 150);
+                if (searchTerm) {
+                  preview = highlightSearchTerm(preview, searchTerm);
+                }
+                contentHTML += `<div class="content-preview"><strong>Sample:</strong> ${preview}${docs[0].content.length > 150 ? '...' : ''}</div>`;
+              }
+              
+              div.innerHTML = contentHTML;
+              scrapedDataPopupList.appendChild(div);
+            });
+          } else {
+            // Detailed view - show all chunks
+            data.documents.forEach(doc => {
+              if (searchTerm && !doc.content?.toLowerCase().includes(searchTerm) && 
+                  !doc.metadata?.source?.toLowerCase().includes(searchTerm)) {
+                return; // Skip if doesn't match search
+              }
+              
+              const div = document.createElement('div');
+              div.className = 'scraped-data-item';
+              
+              const title = doc.metadata?.title || 'No title';
+              const source = doc.metadata?.source || 'Unknown';
+              const chunkId = doc.metadata?.chunk_id !== undefined ? doc.metadata.chunk_id : 'Unknown';
+              
+              let contentHTML = `<h4>${title}</h4>`;
+              contentHTML += `<div class="source-url"><i class="fas fa-link"></i> ${source}</div>`;
+              contentHTML += `<div><i class="fas fa-puzzle-piece"></i> Chunk ID: ${chunkId}</div>`;
+              
+              if (doc.content) {
+                let content = doc.content;
+                if (searchTerm) {
+                  content = highlightSearchTerm(content, searchTerm);
+                }
+                contentHTML += `<div class="content-preview">${content}</div>`;
+              }
+              
+              div.innerHTML = contentHTML;
+              scrapedDataPopupList.appendChild(div);
+            });
+          }
+        }
+        
+        // Filter already displayed data based on search term
+        function filterScrapedData(searchTerm) {
+          const items = scrapedDataPopupList.querySelectorAll('.scraped-data-item');
+          let hasVisibleItems = false;
+          
+          items.forEach(item => {
+            const text = item.textContent.toLowerCase();
+            if (text.includes(searchTerm)) {
+              item.style.display = 'block';
+              hasVisibleItems = true;
+              
+              // Update highlights if we have a search term
+              if (searchTerm) {
+                const contentPreviews = item.querySelectorAll('.content-preview');
+                contentPreviews.forEach(preview => {
+                  const originalText = preview.getAttribute('data-original') || preview.innerHTML;
+                  if (!preview.getAttribute('data-original')) {
+                    preview.setAttribute('data-original', originalText);
+                  }
+                  preview.innerHTML = highlightSearchTerm(originalText, searchTerm);
+                });
+              }
+            } else {
+              item.style.display = 'none';
+            }
+          });
+          
+          if (!hasVisibleItems) {
+            const noResults = document.createElement('div');
+            noResults.className = 'scraped-data-item';
+            noResults.innerHTML = `<i class="fas fa-search"></i> No results found for "${searchTerm}"`;
+            scrapedDataPopupList.appendChild(noResults);
+          }
+        }
+        
+        // Highlight search term in text
+        function highlightSearchTerm(text, term) {
+          if (!term) return text;
+          
+          const regex = new RegExp(term, 'gi');
+          return text.replace(regex, match => `<span class="highlight">${match}</span>`);
+        }
+        
+        // Train Flash Model functionality
+        document.getElementById('train-flash-model').addEventListener('click', function() {
+          // Show confirmation dialog
+          if (confirm('This will create a synthetic dataset from your scraped data to improve Flash mode accuracy. Continue?')) {
+            // Start training process
+            startTraining();
+          }
+        });
+        
+        let trainingInterval = null; // To track status check interval
+        
+        function startTraining() {
+          // Disable training button and show loading state
+          const trainBtn = document.getElementById('train-flash-model');
+          trainBtn.disabled = true;
+          trainBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Training...';
+          
+          // Update status message
+          const statusContainer = document.getElementById('system-status');
+          statusContainer.innerHTML = '<div class="status-info"><i class="fas fa-cog fa-spin"></i> Creating synthetic training data...</div>';
+          
+          // Call the training API endpoint
+          fetch('/api/train_flash_model', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              num_examples: 50 // Generate 50 examples by default
+            })
+          })
+          .then(response => response.json())
+          .then(data => {
+            console.log('Training started:', data);
+            
+            // Start periodically checking training status
+            trainingInterval = setInterval(checkTrainingStatus, 5000); // Check every 5 seconds
+          })
+          .catch(error => {
+            console.error('Error starting training:', error);
+            trainBtn.disabled = false;
+            trainBtn.innerHTML = '<i class="fas fa-graduation-cap"></i> Train Flash Model';
+            statusContainer.innerHTML += '<div class="error"><strong>Error:</strong> ' + error + '</div>';
+          });
+        }
+        
+        function checkTrainingStatus() {
+          fetch('/api/train_status')
+          .then(response => response.json())
+          .then(data => {
+            const status = data.training_status;
+            const statusContainer = document.getElementById('system-status');
+            const trainBtn = document.getElementById('train-flash-model');
+            
+            // Update status display
+            let statusHTML = '';
+            
+            if (status.is_training) {
+              statusHTML = '<div class="status-info"><i class="fas fa-cog fa-spin"></i> <strong>Training in progress</strong><br>';
+              if (status.generated_examples > 0) {
+                statusHTML += `Generated ${status.generated_examples} examples so far.<br>`;
+              }
+              if (status.elapsed_time) {
+                statusHTML += `Time elapsed: ${Math.round(status.elapsed_time)}s</div>`;
+              }
+            } else if (status.error) {
+              statusHTML = '<div class="error"><strong>Training Error:</strong> ' + status.error + '</div>';
+              clearInterval(trainingInterval);
+              trainBtn.disabled = false;
+              trainBtn.innerHTML = '<i class="fas fa-graduation-cap"></i> Train Flash Model';
+            } else if (status.generated_examples > 0) {
+              // Training complete
+              statusHTML = '<div class="success"><strong>Training Complete!</strong><br>';
+              statusHTML += `Generated ${status.generated_examples} QA pairs.<br>`;
+              if (status.elapsed_time) {
+                statusHTML += `Time taken: ${Math.round(status.elapsed_time)}s<br>`;
+              }
+              statusHTML += '<button id="evaluate-btn" class="primary-button">Evaluate Flash Mode</button></div>';
+              
+              clearInterval(trainingInterval);
+              trainBtn.disabled = false;
+              trainBtn.innerHTML = '<i class="fas fa-graduation-cap"></i> Train Flash Model';
+              
+              // After updating the DOM, add the event listener
+              setTimeout(() => {
+                const evalBtn = document.getElementById('evaluate-btn');
+                if (evalBtn) {
+                  evalBtn.addEventListener('click', startEvaluation);
+                }
+              }, 100);
+            }
+            
+            if (statusHTML) {
+              statusContainer.innerHTML = statusHTML;
+            }
+          })
+          .catch(error => {
+            console.error('Error checking training status:', error);
+          });
+        }
+        
+        function startEvaluation() {
+          // Disable evaluate button and show loading
+          const evalBtn = document.getElementById('evaluate-btn');
+          const statusContainer = document.getElementById('system-status');
+          
+          if (evalBtn) {
+            evalBtn.disabled = true;
+            evalBtn.textContent = 'Evaluating...';
+          }
+          
+          statusContainer.innerHTML = '<div class="status-info"><i class="fas fa-cog fa-spin"></i> <strong>Evaluating Flash Mode...</strong><br>Testing with synthetic questions to measure accuracy.</div>';
+          
+          // Call the evaluation API endpoint
+          fetch('/api/evaluate_flash_model', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              num_examples: 20 // Evaluate with 20 examples
+            })
+          })
+          .then(response => response.json())
+          .then(data => {
+            console.log('Evaluation started:', data);
+            
+            // Start periodically checking evaluation status
+            trainingInterval = setInterval(checkEvaluationStatus, 5000); // Check every 5 seconds
+          })
+          .catch(error => {
+            console.error('Error starting evaluation:', error);
+            statusContainer.innerHTML += '<div class="error"><strong>Error:</strong> ' + error + '</div>';
+            if (evalBtn) {
+              evalBtn.disabled = false;
+              evalBtn.textContent = 'Evaluate Flash Mode';
+            }
+          });
+        }
+        
+        function checkEvaluationStatus() {
+          fetch('/api/train_status')
+          .then(response => response.json())
+          .then(data => {
+            const status = data.training_status;
+            const statusContainer = document.getElementById('system-status');
+            
+            // Update status display
+            let statusHTML = '';
+            
+            if (status.is_evaluating) {
+              statusHTML = '<div class="status-info"><i class="fas fa-cog fa-spin"></i> <strong>Evaluation in progress</strong><br>';
+              if (status.elapsed_time) {
+                statusHTML += `Time elapsed: ${Math.round(status.elapsed_time)}s</div>`;
+              }
+            } else if (status.error) {
+              statusHTML = '<div class="error"><strong>Evaluation Error:</strong> ' + status.error + '</div>';
+              clearInterval(trainingInterval);
+            } else if (status.accuracy !== null) {
+              // Evaluation complete
+              statusHTML = '<div class="success"><strong>Evaluation Complete!</strong><br>';
+              statusHTML += `Flash Mode Accuracy: ${(status.accuracy * 100).toFixed(2)}%<br>`;
+              if (status.elapsed_time) {
+                statusHTML += `Time taken: ${Math.round(status.elapsed_time)}s<br>`;
+              }
+              statusHTML += '<p>The Flash mode has been trained on synthetic data generated from your scraped content. ' + 
+                           'Try asking questions about the website to test the improved accuracy!</p></div>';
+              
+              clearInterval(trainingInterval);
+            }
+            
+            if (statusHTML) {
+              statusContainer.innerHTML = statusHTML;
+            }
+          })
+          .catch(error => {
+            console.error('Error checking evaluation status:', error);
+          });
+        }
       });
     </script>
   </body>

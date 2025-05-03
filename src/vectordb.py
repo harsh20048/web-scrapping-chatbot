@@ -44,19 +44,15 @@ class VectorDB:
                 metadata={"hnsw:space": "cosine"}
             )
     
-    def add_documents(self, documents: List[Dict[str, Any]]) -> None:
+    def add_documents(self, documents: List[Dict[str, Any]], batch_size=150) -> None:
         """
-        Add documents to the vector database.
+        Add documents to the vector database in batches to avoid exceeding ChromaDB's limit.
         
         Args:
             documents (List[Dict]): List of documents to add
+            batch_size (int): Maximum number of documents to add in a single batch
+                               (ChromaDB has a limit of 166, so we stay below that)
         """
-        # Extract documents in the format expected by ChromaDB
-        ids = [f"doc_{i}" for i in range(len(documents))]
-        contents = [doc['content'] for doc in documents]
-        metadatas = [doc['metadata'] for doc in documents]
-        embeddings = [doc['embedding'] for doc in documents if 'embedding' in doc]
-        
         # Make sure the collection exists
         try:
             self.collection = self.chroma_client.get_collection(name=self.collection_name)
@@ -67,22 +63,43 @@ class VectorDB:
                 metadata={"hnsw:space": "cosine"}
             )
         
-        # Add documents to the collection
-        if embeddings and len(embeddings) == len(documents):
-            # If embeddings are provided
-            self.collection.add(
-                ids=ids,
-                embeddings=embeddings,
-                documents=contents,
-                metadatas=metadatas
-            )
-        else:
-            # If embeddings are not provided, ChromaDB will generate them
-            self.collection.add(
-                ids=ids,
-                documents=contents,
-                metadatas=metadatas
-            )
+        # Process documents in batches
+        total_docs = len(documents)
+        print(f"Adding {total_docs} documents to vector database in batches of {batch_size}...")
+        
+        for batch_start in range(0, total_docs, batch_size):
+            batch_end = min(batch_start + batch_size, total_docs)
+            batch = documents[batch_start:batch_end]
+            
+            # Generate IDs for this batch
+            # Use a global counter to ensure unique IDs across batches
+            ids = [f"doc_{batch_start + i}" for i in range(len(batch))]
+            
+            # Extract data for this batch
+            contents = [doc['content'] for doc in batch]
+            metadatas = [doc['metadata'] for doc in batch]
+            
+            # Check if embeddings are provided
+            if 'embedding' in batch[0]:
+                embeddings = [doc['embedding'] for doc in batch]
+                # Add documents with embeddings
+                self.collection.add(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=contents,
+                    metadatas=metadatas
+                )
+            else:
+                # If embeddings are not provided, ChromaDB will generate them
+                self.collection.add(
+                    ids=ids,
+                    documents=contents,
+                    metadatas=metadatas
+                )
+            
+            print(f"Added batch {batch_start//batch_size + 1}/{(total_docs + batch_size - 1)//batch_size}: {len(batch)} documents")
+            
+        print(f"Successfully added all {total_docs} documents to the vector database.")
     
     def query(self, embedding, n_results=5):
         """
@@ -141,6 +158,33 @@ class VectorDB:
                 'document_count': 0,
                 'error': str(e)
             }
+    
+    def get_all_documents(self):
+        """
+        Get all documents from the vector database.
+        
+        Returns:
+            List[Dict]: List of documents with their content and metadata
+        """
+        try:
+            # Make sure the collection exists
+            self.collection = self.chroma_client.get_collection(name=self.collection_name)
+            
+            # Get all documents
+            results = self.collection.get()
+            
+            # Format the results into a list of dictionaries
+            documents = []
+            for i, (doc, metadata) in enumerate(zip(results['documents'], results['metadatas'])):
+                documents.append({
+                    'content': doc,
+                    'metadata': metadata
+                })
+                
+            return documents
+        except Exception as e:
+            print(f"Error retrieving documents: {str(e)}")
+            return []
     
     def reset_collection(self):
         """Reset (delete and recreate) the collection."""

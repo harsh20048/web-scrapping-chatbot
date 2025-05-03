@@ -11,10 +11,13 @@ import requests
 import re
 import logging
 import traceback
-
+import argparse
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from dotenv import load_dotenv
 from src.rag import RAG
+from src.model_trainer import ModelTrainer
+
 
 # Configure logging
 logging.basicConfig(
@@ -61,16 +64,17 @@ def store_chat_message(role, message):
 # Initialize Flask app
 app = Flask(__name__)
 
+
 # Configuration
 config = {
     'scrape_delay': int(os.getenv('SCRAPE_DELAY', '1')),
     'max_pages': int(os.getenv('MAX_PAGES', '50')),
+    'model_name': os.getenv('MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
     'ollama_host': os.getenv('OLLAMA_HOST', 'http://localhost:11434'),
-    'model_name': os.getenv('DEEP_MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
     'quick_model_name': os.getenv('QUICK_MODEL_NAME', 'llama3.2:3b-instruct-q3_K_M'),
-    'speed_model_name': os.getenv('SPEED_MODEL_NAME', 'llama3.2:1b-instruct-q2_K'),
+    'speed_model_name': os.getenv('SPEED_MODEL_NAME', 'phi3:3.8b-mini-4k-instruct-q4_K_M'),  # Upgraded to phi3 for better accuracy
     'deep_model_name': os.getenv('DEEP_MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
-    'deepseek_model_name': os.getenv('DEEPSEEK_MODEL_NAME', 'codegemma:2b-code'),
+    'deepseek_model_name': os.getenv('DEEPSEEK_MODEL_NAME', 'deepseek-r1:1.5b'),
     'chunk_size': int(os.getenv('CHUNK_SIZE', '300')),
     'chunk_overlap': int(os.getenv('CHUNK_OVERLAP', '30')),
     'persist_directory': os.getenv('PERSIST_DIRECTORY', './data/chroma'),
@@ -122,11 +126,24 @@ def load_chat_history():
 # Initialize RAG system
 rag = RAG()
 
+# Initialize ModelTrainer
+model_trainer = ModelTrainer(rag)
+
 # Store scraping status
 scraping_status = {
     'is_scraping': False,
     'current_url': None,
     'documents_processed': 0,
+    'error': None,
+    'elapsed_time': None
+}
+
+# Store training status
+training_status = {
+    'is_training': False,
+    'is_evaluating': False,
+    'generated_examples': 0,
+    'accuracy': None,
     'error': None,
     'elapsed_time': None
 }
@@ -273,82 +290,6 @@ def query():
         logger.error(f"Error in query: {str(e)}\n{error_details}")
         return jsonify({'error': str(e), 'details': error_details}), 500
 
-@app.route('/api/ollama_deepseek', methods=['POST'])
-def ollama_deepseek():
-    """Deep analysis mode using direct Ollama completion"""
-    if not request.json or 'prompt' not in request.json:
-        logger.error("No prompt provided for deep analysis")
-        return jsonify({'error': 'No prompt provided'}), 400
-    
-    prompt = request.json['prompt']
-    logger.info(f"Processing deep analysis: {prompt[:50]}...")
-    
-    try:
-        # Get documents to analyze using vectordb query instead of retriever
-        query_embedding = rag.embedding_model.embed_query(prompt)
-        retrieved_docs = rag.vectordb.query(query_embedding, n_results=5)
-        
-        if not retrieved_docs:
-            logger.warning("No relevant documents found for deep analysis")
-            return jsonify({'error': 'No relevant documents found. Please try another query or scrape more content.'}), 400
-        
-        # Prepare context for the model
-        context_text = "\n\n".join([doc['content'] for doc in retrieved_docs])
-        
-        # Create a detailed analysis prompt
-        system_prompt = """You are an expert analyst that performs deep analysis of text. 
-        Given the following content from a website, provide a detailed analysis in response to the user's query.
-        Focus on extracting the most relevant information and providing a comprehensive answer.
-        If you don't know or the information is not in the provided content, say so honestly.
-        Format your response in markdown for better readability."""
-        
-        full_prompt = f"{system_prompt}\n\nCONTENT TO ANALYZE:\n{context_text}\n\nQUERY: {prompt}\n\nANALYSIS:"
-        
-        # Call Ollama API directly for more control
-        response = requests.post(
-            f"{config['ollama_host']}/api/generate",
-            json={
-                "model": config['deep_model_name'],
-                "prompt": full_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.3,
-                    "top_p": 0.9,
-                    "top_k": 40,
-                    "num_predict": 1024
-                }
-            }
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            # Extract contexts for reference
-            contexts = []
-            for doc in retrieved_docs[:3]:
-                contexts.append({
-                    "text": doc['content'][:200] + "...",
-                    "source": doc['metadata'].get('source', '') if isinstance(doc['metadata'], dict) else '',
-                    "title": doc['metadata'].get('title', '') if isinstance(doc['metadata'], dict) else ''
-                })
-            
-            # Store in chat history
-            store_chat_message('user', prompt)
-            store_chat_message('bot', result['response'])
-            
-            return jsonify({
-                'result': result['response'],
-                'contexts': contexts
-            })
-        else:
-            error_details = traceback.format_exc()
-            logger.error(f"Error in deep analysis: {response.status_code}\n{error_details}")
-            return jsonify({'error': f"Ollama API error: {response.status_code}", 'details': error_details}), response.status_code
-            
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in deep analysis: {str(e)}\n{error_details}")
-        return jsonify({'error': str(e), 'details': error_details}), 500
-
 @app.route('/api/reset', methods=['POST'])
 def reset_database():
     """API endpoint to reset the vector database."""
@@ -439,12 +380,172 @@ def view_chunks():
         logger.error(f"Error in viewing chunks: {str(e)}\n{error_details}")
         return f'<p>Error fetching chunks: {e}</p>', 500
 
+@app.route('/api/scraped_data')
+def get_scraped_data():
+    """API endpoint to get all scraped data for display in the UI."""
+    try:
+        # Get view type from query parameters (summary or detailed)
+        view_type = request.args.get('view_type', 'summary')
+        
+        # Get all stored documents (chunks)
+        results = rag.vectordb.collection.get()
+        documents = results.get('documents', [])
+        metadatas = results.get('metadatas', [])
+        
+        # Format the response
+        formatted_docs = []
+        for i, (content, metadata) in enumerate(zip(documents, metadatas)):
+            doc = {
+                'content': content,
+                'metadata': metadata
+            }
+            formatted_docs.append(doc)
+        
+        return jsonify({
+            'status': 'success',
+            'document_count': len(formatted_docs),
+            'documents': formatted_docs
+        })
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"Error in getting scraped data: {str(e)}\n{error_details}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'details': error_details
+        }), 500
+
+@app.route('/api/train_flash_model', methods=['POST'])
+def train_flash_model():
+    """API endpoint to train the Flash model with synthetic QA dataset."""
+    global training_status
+    
+    try:
+        # Check if already training
+        if training_status['is_training']:
+            return jsonify({
+                'status': 'in_progress',
+                'message': 'Training is already in progress',
+                'training_status': training_status
+            })
+        
+        # Get training parameters from request
+        data = request.json or {}
+        num_examples = data.get('num_examples', 50)  # Default to 50 examples
+        
+        # Start training in a separate thread
+        def training_task():
+            global training_status
+            start_time = time.time()
+            training_status['is_training'] = True
+            training_status['error'] = None
+            
+            try:
+                # Generate synthetic dataset
+                training_data = model_trainer.create_synthetic_dataset(num_examples=num_examples)
+                training_status['generated_examples'] = len(training_data)
+                training_status['elapsed_time'] = time.time() - start_time
+                training_status['is_training'] = False
+                logger.info(f"Training completed: {len(training_data)} examples generated")
+            except Exception as e:
+                error_details = traceback.format_exc()
+                logger.error(f"Error in training: {str(e)}\n{error_details}")
+                training_status['error'] = str(e)
+                training_status['is_training'] = False
+        
+        # Start training thread
+        threading.Thread(target=training_task).start()
+        
+        return jsonify({
+            'status': 'started',
+            'message': f'Started training with {num_examples} synthetic examples',
+            'training_status': training_status
+        })
+    
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"Error starting training: {str(e)}\n{error_details}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'details': error_details
+        }), 500
+
+@app.route('/api/evaluate_flash_model', methods=['POST'])
+def evaluate_flash_model():
+    """API endpoint to evaluate the Flash model with the synthetic QA dataset."""
+    global training_status
+    
+    try:
+        # Check if already evaluating
+        if training_status['is_evaluating']:
+            return jsonify({
+                'status': 'in_progress',
+                'message': 'Evaluation is already in progress',
+                'training_status': training_status
+            })
+        
+        # Get evaluation parameters from request
+        data = request.json or {}
+        num_examples = data.get('num_examples', 20)  # Default to 20 examples for evaluation
+        
+        # Start evaluation in a separate thread
+        def evaluation_task():
+            global training_status
+            start_time = time.time()
+            training_status['is_evaluating'] = True
+            training_status['error'] = None
+            
+            try:
+                # Evaluate the model
+                results = model_trainer.evaluate_flash_mode(num_examples=num_examples)
+                training_status['accuracy'] = results['metrics']['accuracy']
+                training_status['elapsed_time'] = time.time() - start_time
+                training_status['is_evaluating'] = False
+                logger.info(f"Evaluation completed: Accuracy = {results['metrics']['accuracy']}")
+            except Exception as e:
+                error_details = traceback.format_exc()
+                logger.error(f"Error in evaluation: {str(e)}\n{error_details}")
+                training_status['error'] = str(e)
+                training_status['is_evaluating'] = False
+        
+        # Start evaluation thread
+        threading.Thread(target=evaluation_task).start()
+        
+        return jsonify({
+            'status': 'started',
+            'message': f'Started evaluation with {num_examples} examples',
+            'training_status': training_status
+        })
+    
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.error(f"Error starting evaluation: {str(e)}\n{error_details}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'details': error_details
+        }), 500
+
+@app.route('/api/train_status')
+def get_train_status():
+    """API endpoint to get the current training/evaluation status."""
+    global training_status
+    
+    return jsonify({
+        'status': 'success',
+        'training_status': training_status
+    })
+
 if __name__ == '__main__':
     # Create data directory if it doesn't exist
     os.makedirs('./data/chroma', exist_ok=True)
     
     # Create embed directory if it doesn't exist
     os.makedirs('./embed', exist_ok=True)
+    
+    # Create data directory for training if it doesn't exist
+    os.makedirs('./data', exist_ok=True)
     
     # For development, run with debug=True
     app.run(debug=True, host='0.0.0.0', port=5000)

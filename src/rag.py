@@ -54,13 +54,13 @@ class RAG:
         self.quick_model_name = self.config.get('quick_model_name', os.getenv('QUICK_MODEL_NAME', 'llama3.2:3b-instruct-q3_K_M'))
         self.speed_model_name = self.config.get('speed_model_name', os.getenv('SPEED_MODEL_NAME', 'llama3.2:1b-instruct-q2_K'))
         self.deep_model_name = self.config.get('deep_model_name', os.getenv('DEEP_MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'))
-        self.deepseek_model_name = self.config.get('deepseek_model_name', os.getenv('DEEPSEEK_MODEL_NAME', 'codegemma:2b-code'))
+        self.deepseek_model_name = self.config.get('deepseek_model_name', os.getenv('DEEPSEEK_MODEL_NAME', 'deepseek-r1:1.5b'))
         
         # --- Backup LLMs for each mode ---
         self.quick_backup_model = self.config.get('quick_backup_model', os.getenv('QUICK_BACKUP_MODEL', 'tinyllama:1.1b-chat'))
         self.speed_backup_model = self.config.get('speed_backup_model', os.getenv('SPEED_BACKUP_MODEL', 'phi:latest'))
         self.deep_backup_model = self.config.get('deep_backup_model', os.getenv('DEEP_BACKUP_MODEL', 'gemma:2b-instruct-q4_0'))
-        self.deepseek_backup_model = self.config.get('deepseek_backup_model', os.getenv('DEEPSEEK_BACKUP_MODEL', 'deepseek-coder:1.3b'))
+        self.deepseek_backup_model = self.config.get('deepseek_backup_model', os.getenv('DEEPSEEK_BACKUP_MODEL', 'deepseek-coder:1.3b'))  # Update the DeepSeek backup model configuration
         
         # Initialize components as needed
         self.processor = TextProcessor(
@@ -379,7 +379,7 @@ WEBSITE CONTENT SAMPLES:
             traceback.print_exc()
             return 0
     
-    def query(self, user_query, n_results=1, temperature=0.3, max_tokens=128, mode="speed"):  # Default to speed mode
+    def query(self, user_query, n_results=1, temperature=0.1, max_tokens=512, mode="default"):  
         """
         Answer a user query using the RAG system, supporting multiple modes with fallback options.
         Args:
@@ -393,6 +393,9 @@ WEBSITE CONTENT SAMPLES:
         """
         import time
         print(f"Processing query: {user_query} [mode={mode}]")
+        
+        # Start timing
+        t0 = time.time()
         
         # Check for typos and correct if needed
         corrected_query, has_correction = self.check_for_typos(user_query)
@@ -415,7 +418,170 @@ WEBSITE CONTENT SAMPLES:
             return self.get_website_summary(mode)
             
         try:
-            t0 = time.time()
+            # Check if we have documents
+            if not self.has_documents():
+                return {
+                    "answer": "No documents in the database. Please scrape a website first.",
+                    "contexts": []
+                }
+            
+            # Generate query embedding
+            query_embedding = self.embedding_model.embed_query(user_query)
+            print(f"[DEBUG] Query embedding shape: {query_embedding.shape if hasattr(query_embedding, 'shape') else type(query_embedding)}")
+            
+            # --- Hybrid Retrieval for Flash mode ---
+            if mode == "flash":
+                n_semantic = 10  # Increased from 7
+                n_keyword = 8    # Increased from 5
+                n_results = 15   # Increased from 12
+                # Vector search (semantic)
+                semantic_docs = self.vectordb.query(query_embedding, n_results=n_semantic)
+                
+                # Extract phrases for better matching
+                query_words = user_query.lower().split()
+                query_phrases = []
+                for i in range(len(query_words) - 1):
+                    query_phrases.append(f"{query_words[i]} {query_words[i+1]}")
+                
+                # Keyword search with phrase matching
+                all_docs = self.vectordb.get_all_documents() if hasattr(self.vectordb, 'get_all_documents') else []
+                keyword_docs = []
+                if all_docs:
+                    query_word_set = set(query_words)
+                    scored = []
+                    for doc in all_docs:
+                        content = doc['content'].lower()
+                        # Score for keyword matches
+                        word_overlap = len(query_word_set.intersection(set(content.split())))
+                        # Score for phrase matches (weighted higher)
+                        phrase_score = sum(2 for phrase in query_phrases if phrase in content)
+                        # Combined score
+                        total_score = word_overlap + phrase_score
+                        
+                        # Boost score if title matches query keywords
+                        if 'title' in doc['metadata']:
+                            title = doc['metadata']['title'].lower()
+                            title_boost = len(query_word_set.intersection(set(title.split())))
+                            total_score += title_boost * 2  # Double weight for title matches
+                            
+                        scored.append((total_score, doc))
+                    scored.sort(reverse=True, key=lambda x: x[0])
+                    keyword_docs = [doc for score, doc in scored[:n_keyword] if score > 0]
+                
+                # Merge and deduplicate
+                doc_ids = set()
+                merged_docs = []
+                # Add semantic search results first (they're often better quality)
+                for doc in semantic_docs:
+                    doc_id = (doc['metadata'].get('source', ''), doc['metadata'].get('chunk_id', -1))
+                    if doc_id not in doc_ids:
+                        merged_docs.append(doc)
+                        doc_ids.add(doc_id)
+                # Then add keyword search results
+                for doc in keyword_docs:
+                    doc_id = (doc['metadata'].get('source', ''), doc['metadata'].get('chunk_id', -1))
+                    if doc_id not in doc_ids:
+                        merged_docs.append(doc)
+                        doc_ids.add(doc_id)
+                        
+                # Advanced reranking with multiple factors
+                reranked_docs = []
+                for doc in merged_docs:
+                    content = doc['content'].lower()
+                    # Base score: keyword overlap
+                    keyword_score = len(query_word_set.intersection(set(content.split())))
+                    # Phrase match score
+                    phrase_score = sum(2 for phrase in query_phrases if phrase in content)
+                    # Context length score (favor medium-length contexts)
+                    length = len(content.split())
+                    length_score = 1.0 if 50 <= length <= 200 else 0.5
+                    # Title match score
+                    title_score = 0
+                    if 'title' in doc['metadata']:
+                        title = doc['metadata']['title'].lower()
+                        title_score = len(query_word_set.intersection(set(title.split()))) * 2
+                    
+                    total_score = keyword_score + phrase_score + title_score + length_score
+                    reranked_docs.append((total_score, doc))
+                    
+                reranked_docs.sort(reverse=True, key=lambda x: x[0])
+                retrieved_docs = [doc for score, doc in reranked_docs[:n_results]]
+                print(f"[DEBUG] Enhanced hybrid retrieval: {len(retrieved_docs)} docs (semantic+keyword+phrase, advanced reranking)")
+                
+                if not retrieved_docs:
+                    print("[DEBUG] No relevant documents found for query.")
+                    return {
+                        "answer": "I couldn't find any relevant information about that in the website content. Could you try asking a different question related to the website you scraped?",
+                        "contexts": []
+                    }
+                # Prepare the prompt with context and query
+                context_text = "\n\n".join([doc['content'] for doc in retrieved_docs])
+            else:
+                # Retrieve relevant documents (original logic)
+                retrieved_docs = self.vectordb.query(query_embedding, n_results=n_results)
+                print(f"[DEBUG] Retrieved {len(retrieved_docs)} docs from vector DB")
+                if not retrieved_docs:
+                    print("[DEBUG] No relevant documents found for query.")
+                    return {
+                        "answer": "I couldn't find any relevant information about that in the website content. Could you try asking a different question related to the website you scraped?",
+                        "contexts": []
+                    }
+                # Prepare the prompt with context and query
+                context_text = "\n\n".join([doc['content'] for doc in retrieved_docs])
+            
+            # Use the appropriate prompt template based on mode
+            if mode == "speed" or mode == "flash":
+                prompt_template = """You are an expert assistant specializing in Contisoft Technologies and their products including RenewalHelp, supplier management solutions, and IT services.
+
+Context information about Contisoft Technologies is below:
+---
+{context}
+---
+
+Follow these steps carefully to answer the user's question about Contisoft Technologies:
+1. Read ALL context information completely and identify ALL relevant facts about Contisoft Technologies
+2. Extract the EXACT information from the context needed to answer correctly and comprehensively
+3. Formulate a direct, factual answer using ONLY information present in the context
+4. Include specific product names, features, or services that Contisoft offers when relevant
+5. Use exact terminology, product names, and descriptions from the context about Contisoft Technologies
+
+If the specific information isn't explicitly stated in the context, say "I don't have enough information about that aspect of Contisoft Technologies in the website content."
+
+Do NOT add ANY information beyond what's in the context, even if it seems obvious or helpful.
+Respond directly to the question with relevant details about Contisoft Technologies and their offerings.
+
+Question: {question}
+Thinking: I'll carefully analyze ALL the context provided about Contisoft Technologies to find the exact information...
+Answer: """
+            elif mode == "deepseek":
+                prompt_template = """You are a code and technical expert that provides precise answers based on the provided context.
+
+Context information is below:
+---
+{context}
+---
+
+Given the context information and no prior knowledge, provide a technically accurate answer to the question.
+If the question involves code, provide working code examples and explanations.
+If the answer cannot be determined from the context, say "I don't have enough information to answer this question."
+
+Question: {question}
+Answer: """
+            else:  # deep mode (default)
+                prompt_template = """You are a helpful, accurate assistant that provides detailed answers based on the provided context.
+
+Context information is below:
+---
+{context}
+---
+
+Given the context information and no prior knowledge, provide a comprehensive answer to the question.
+If the answer cannot be determined from the context, say "I don't have enough information to answer this question."
+Include relevant details from the context and organize your answer in a clear, readable format.
+
+Question: {question}
+Answer: """
+            
             # Set mode-specific parameters
             if mode == "quick":
                 n_results = 2
@@ -423,7 +589,7 @@ WEBSITE CONTENT SAMPLES:
                 max_tokens = 256
                 primary_model = self.quick_llm
                 backup_model = self.quick_backup_llm
-            elif mode == "speed":
+            elif mode == "speed" or mode == "flash":
                 n_results = 1
                 temperature = 0.2
                 max_tokens = 128
@@ -435,74 +601,53 @@ WEBSITE CONTENT SAMPLES:
                 max_tokens = 256
                 primary_model = self.deepseek_llm
                 backup_model = self.deepseek_backup_llm
-            else:  # deep mode (default)
+            else:  # deep mode
                 n_results = 4  # Reduced from 8 to 4 for better performance
                 temperature = 0.5
                 max_tokens = 512  # Reduced from 1024 to 512
                 primary_model = self.llm
                 backup_model = self.deep_backup_llm
             
-            # Check if collection has documents
-            if not self.has_documents():
-                return {
-                    "answer": "I don't have any website content in my database yet. Please scrape a website first using the 'Start Scraping' button.",
-                    "contexts": []
-                }
+            # Prepare the prompt with context and query
+            prompt = prompt_template.format(context=context_text, question=corrected_query)
             
-            # Generate query embedding
-            query_embedding = self.embedding_model.embed_query(user_query)
-            print(f"[DEBUG] Query embedding shape: {query_embedding.shape if hasattr(query_embedding, 'shape') else type(query_embedding)}")
-            
-            # Retrieve relevant documents
-            retrieved_docs = self.vectordb.query(query_embedding, n_results=n_results)
-            print(f"[DEBUG] Retrieved {len(retrieved_docs)} docs from vector DB")
-            if not retrieved_docs:
-                print("[DEBUG] No relevant documents found for query.")
-                return {
-                    "answer": "I couldn't find any relevant information about that in the website content. Could you try asking a different question related to the website you scraped?",
-                    "contexts": []
-                }
-            
-            # Generate answer using primary LLM with fallback to backup model
-            print(f"[DEBUG] Calling primary LLM with RAG context... [mode={mode}]")
-            t_llm_start = time.time()
-            
-            # Create a more directive prompt that helps with simple responses
-            enhanced_prompt = f"""Based on the following context from a website, please answer the user's question.
-Be friendly, helpful, and concise. Provide a direct and factual answer to the question based only on the information in the context.
-
-User question: {user_query}
-
-Website context:
-"""
-            for i, doc in enumerate(retrieved_docs):
-                enhanced_prompt += f"[Document {i+1}]: {doc['content']}\n\n"
-            
-            # If we corrected typos, add a note about it
-            if has_correction:
-                enhanced_prompt += f"""
-Note: I noticed you may have meant to ask: "{corrected_query}" instead of "{original_query}". I'll answer based on this corrected understanding.
-
-"""
-            
-            enhanced_prompt += """
-Instructions:
-1. Stay strictly within the facts presented in the context
-2. If the context doesn't provide enough information, clearly state that
-3. Be direct and to the point in your answer
-4. Do not mention the documents or refer to them explicitly in your answer
-
-Your answer:"""
-            
+            # Try primary model first
             try:
-                # Try with primary model first using enhanced prompt
-                answer = primary_model.answer_with_rag(enhanced_prompt, [], temperature=temperature, max_tokens=max_tokens)
-                print(f"[DEBUG] Primary LLM answer generated successfully")
+                response = primary_model.generate(
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+                # Make sure response is a string before calling strip()
+                if isinstance(response, dict) and 'response' in response:
+                    answer = response['response'].strip()
+                elif isinstance(response, str):
+                    answer = response.strip()
+                else:
+                    answer = str(response)
             except Exception as e:
-                # If primary model fails, fall back to backup model
-                print(f"[DEBUG] Primary LLM failed with error: {str(e)}. Falling back to backup model.")
-                answer = backup_model.answer_with_rag(enhanced_prompt, [], temperature=temperature, max_tokens=max_tokens)
-                print(f"[DEBUG] Backup LLM answer generated successfully")
+                # Log the error and try backup model
+                print(f"Error with primary model: {str(e)}")
+                try:
+                    response = backup_model.generate(
+                        prompt=prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                    # Make sure response is a string before calling strip()
+                    if isinstance(response, dict) and 'response' in response:
+                        answer = response['response'].strip()
+                    elif isinstance(response, str):
+                        answer = response.strip()
+                    else:
+                        answer = str(response)
+                except Exception as e2:
+                    # If both models fail, return error
+                    print(f"Error with backup model: {str(e2)}")
+                    return {
+                        "answer": f"Error generating response: {str(e2)}",
+                        "contexts": []
+                    }
             
             # If we corrected typos, add a note at the beginning of the answer
             if has_correction and not answer.startswith("I noticed"):
@@ -510,7 +655,7 @@ Your answer:"""
             
             t_llm_end = time.time()
             print(f"[DEBUG] LLM answer: {answer[:200]}...")
-            print(f"[DEBUG] LLM response time: {t_llm_end - t_llm_start:.2f}s")
+            print(f"[DEBUG] LLM response time: {t_llm_end - t0:.2f}s")
             
             # Format contexts for response
             contexts = []
