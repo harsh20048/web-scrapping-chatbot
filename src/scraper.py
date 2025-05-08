@@ -109,21 +109,69 @@ class WebScraper:
                     homepage_debugged = True
                 
                 if len(content) > 50:  # Lowered threshold for storing
-                    # --- Metadata enrichment ---
+                    # --- Enhanced Metadata Extraction ---
+                    # 1. Section heading extraction - try h1, h2, h3 tags
                     section_heading = None
                     page_hierarchy = [title] if title else []
-                    # Try to extract the first h1/h2/h3 as section heading
+                    
+                    # Extract all headings to build a proper hierarchy
+                    headings = []
                     for tag in ['h1', 'h2', 'h3']:
-                        heading = soup.find(tag)
-                        if heading:
-                            section_heading = heading.get_text(strip=True)
-                            break
-                    # Simple keyword extraction: top 5 frequent words (excluding stopwords)
-                    from collections import Counter
-                    import re
-                    stopwords = set(['the', 'and', 'for', 'are', 'with', 'that', 'this', 'you', 'your', 'from', 'have', 'has', 'was', 'but', 'not', 'all', 'can', 'will', 'they', 'their', 'our', 'about', 'more', 'who', 'when', 'where', 'how', 'what', 'which', 'also', 'use', 'used', 'using', 'into', 'than', 'other', 'any', 'each', 'such', 'its', 'may', 'one', 'two', 'three', 'four', 'five'])
-                    words = re.findall(r'\b\w+\b', content.lower())
-                    keywords = [w for w, c in Counter(words).most_common(20) if w not in stopwords][:5]
+                        for heading in soup.find_all(tag):
+                            heading_text = heading.get_text(strip=True)
+                            if heading_text and len(heading_text) > 3 and len(heading_text) < 200:
+                                headings.append((tag, heading_text))
+                    
+                    # Use the first heading as the section heading
+                    if headings:
+                        section_heading = headings[0][1]
+                        
+                        # Build page hierarchy from headings (h1 > h2 > h3)
+                        if len(headings) > 1:
+                            # Start with title, then add unique headings
+                            page_hierarchy = [title] if title else []
+                            seen = set(page_hierarchy)
+                            for tag, text in headings:
+                                if text not in seen and len(text) > 3:
+                                    page_hierarchy.append(text)
+                                    seen.add(text)
+                                    if len(page_hierarchy) >= 5:  # Limit hierarchy depth
+                                        break
+                    
+                    # 2. Advanced keyword extraction with TF-IDF weighting
+                    try:
+                        from collections import Counter
+                        import re
+                        from sklearn.feature_extraction.text import TfidfVectorizer
+                        
+                        # Extended stopwords list
+                        stopwords = set(['the', 'and', 'for', 'are', 'with', 'that', 'this', 'you', 'your', 'from', 'have', 'has', 'was', 'but', 'not', 'all', 'can', 'will', 'they', 'their', 'our', 'about', 'more', 'who', 'when', 'where', 'how', 'what', 'which', 'also', 'use', 'used', 'using', 'into', 'than', 'other', 'any', 'each', 'such', 'its', 'may', 'one', 'two', 'three', 'four', 'five', 'an', 'be', 'by', 'do', 'does', 'if', 'in', 'is', 'it', 'of', 'on', 'or', 'to', 'we', 'us', 'as', 'at'])
+                        
+                        # Try TF-IDF if we have enough documents
+                        if len(self.pages_content) > 3:
+                            # Use existing documents plus current one
+                            docs = [d['content'] for d in self.pages_content.values()]
+                            docs.append(content)
+                            
+                            # Apply TF-IDF
+                            vectorizer = TfidfVectorizer(max_features=50, stop_words='english')
+                            tfidf_matrix = vectorizer.fit_transform(docs)
+                            feature_names = vectorizer.get_feature_names_out()
+                            
+                            # Get scores for the current document (last one)
+                            tfidf_scores = zip(feature_names, tfidf_matrix[-1].toarray()[0])
+                            sorted_scores = sorted(tfidf_scores, key=lambda x: x[1], reverse=True)
+                            
+                            # Extract top keywords by TF-IDF score
+                            keywords = [word for word, score in sorted_scores[:10] if len(word) > 2]
+                        else:
+                            # Fallback to frequency-based extraction for small collections
+                            words = re.findall(r'\b\w+\b', content.lower())
+                            keywords = [w for w, c in Counter(words).most_common(30) if w not in stopwords and len(w) > 2][:10]
+                    except ImportError:
+                        # Fallback if scikit-learn is not available
+                        words = re.findall(r'\b\w+\b', content.lower())
+                        keywords = [w for w, c in Counter(words).most_common(20) if w not in stopwords and len(w) > 2][:10]
                     self.pages_content[current_url] = {
                         'title': title,
                         'content': content,

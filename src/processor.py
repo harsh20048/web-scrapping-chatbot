@@ -132,18 +132,38 @@ class TextProcessor:
         
         documents = []
         for i, chunk in enumerate(chunks):
+            # Base metadata that every chunk must have
             metadata = {
                 'source': page_data['url'],
                 'title': page_data['title'],
                 'chunk_id': i,
-                'total_chunks': len(chunks)
+                'total_chunks': len(chunks),
+                'chunk_position': 'middle'
             }
+            
+            # Mark first and last chunks (useful for context retrieval)
+            if i == 0:
+                metadata['chunk_position'] = 'first'
+            elif i == len(chunks) - 1:
+                metadata['chunk_position'] = 'last'
+            
             # Add enriched metadata if present
             for key in ['section_heading', 'page_hierarchy', 'keywords']:
-                if key in page_data:
+                if key in page_data and page_data[key]:
                     metadata[key] = page_data[key]
+            
+            # Create a rich text representation that combines metadata and content
+            # This helps with retrieval as the metadata becomes part of the searchable text
+            rich_text = f"Title: {page_data['title']}\n"
+            if 'section_heading' in page_data and page_data['section_heading']:
+                rich_text += f"Section: {page_data['section_heading']}\n"
+            if 'keywords' in page_data and page_data['keywords']:
+                rich_text += f"Keywords: {', '.join(page_data['keywords'][:5])}\n"
+            rich_text += f"\n{chunk}"
+            
             doc = {
-                'content': chunk,
+                'content': rich_text,  # Enhanced content with metadata
+                'raw_content': chunk,  # Original chunk without metadata
                 'metadata': metadata
             }
             documents.append(doc)
