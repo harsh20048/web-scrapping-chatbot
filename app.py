@@ -197,13 +197,32 @@ def reset_database():
 def get_status():
     """API endpoint to get system status."""
     try:
+        # Get database stats
         db_stats = rag.vectordb.get_collection_stats()
         
+        # Check Ollama connectivity
+        ollama_status = 'disconnected'
+        ollama_models = []
+        try:
+            # Only wait 2 seconds max to check if Ollama is responsive
+            resp = requests.get(f"{config['ollama_host']}/api/tags", timeout=2)
+            if resp.status_code == 200:
+                ollama_status = 'connected'
+                # List available models
+                models_data = resp.json()
+                if 'models' in models_data:
+                    ollama_models = [m.get('name') for m in models_data.get('models', [])]                
+        except Exception:
+            # Don't report the specific error, just note that it's disconnected
+            pass
+            
         return jsonify({
             'status': 'ok',
             'database': db_stats,
             'ollama_host': config['ollama_host'],
-            'model_name': config['model_name']
+            'model_name': config['model_name'],
+            'ollama_status': ollama_status,
+            'available_models': ollama_models
         })
     except Exception as e:
         return jsonify({
@@ -277,26 +296,49 @@ def ollama_deepseek():
             "DO NOT explain your reasoning or thinking - provide ONLY the direct answer to the question.\n" + \
             "Be brief and concise."
         
-        # Call local Ollama DeepSeek model
-        ollama_url = 'http://localhost:11434/api/generate'
+        # Call local Ollama DeepSeek model with improved error handling
+        ollama_url = config['ollama_host'] + '/api/generate'
         payload = {
             'model': config['deepseek_model_name'],
             'prompt': full_prompt,
             'stream': False
         }
-        resp = requests.post(ollama_url, json=payload, timeout=60)
-        if resp.status_code == 200:
-            result = resp.json()
-            
-            # Clean the response to remove meta-commentary
-            response_text = result.get('response', '').strip()
-            cleaned_response = clean_llm_response(response_text)
-            
-            return jsonify({'result': cleaned_response})
-        else:
-            return jsonify({'error': f'Ollama error: {resp.status_code} {resp.text}'})
+        
+        try:
+            # Use shorter timeout to fail faster
+            resp = requests.post(ollama_url, json=payload, timeout=30)
+            if resp.status_code == 200:
+                result = resp.json()
+                
+                # Clean the response to remove meta-commentary
+                response_text = result.get('response', '').strip()
+                cleaned_response = clean_llm_response(response_text)
+                
+                return jsonify({'result': cleaned_response})
+            else:
+                error_msg = resp.text if resp.text else 'Unknown error'
+                
+                # More user-friendly error messages
+                if resp.status_code == 404:
+                    return jsonify({'error': f'Model "{config["deepseek_model_name"]}" not found. Please run: ollama pull {config["deepseek_model_name"]}'})  
+                elif resp.status_code == 500:
+                    return jsonify({'error': 'Ollama server error. This might be due to limited resources or the model being too large.'})
+                else:
+                    return jsonify({'error': f'Ollama error ({resp.status_code}): {error_msg}'})
+                
+        except requests.exceptions.ConnectionError:
+            return jsonify({'error': 'Cannot connect to Ollama. Please make sure Ollama is running on your machine.'})
+        except requests.exceptions.Timeout:
+            return jsonify({'error': 'Connection to Ollama timed out. Please check if Ollama is running properly.'})
     except Exception as e:
-        return jsonify({'error': f'Ollama exception: {e}'})
+        # Generic fallback error handler with more helpful message
+        error_message = str(e)
+        if 'Connection refused' in error_message:
+            return jsonify({'error': 'Cannot connect to Ollama server. Please ensure Ollama is running on your machine.'})
+        elif 'model not found' in error_message.lower():
+            return jsonify({'error': f'The requested model "{config["deepseek_model_name"]}" is not installed. Try running: ollama pull {config["deepseek_model_name"]}'})    
+        else:
+            return jsonify({'error': f'Error processing your request: {error_message}. Please try again later.'})
 
 @app.route('/api/chat_history', methods=['GET'])
 def get_chat_history():
