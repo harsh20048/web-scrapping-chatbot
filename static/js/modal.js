@@ -9,6 +9,21 @@ function hideHistoryModal() {
     if (modal) {
         console.log('Hiding modal via global function');
         modal.classList.add('hidden');
+        // Ensure modal is fully hidden with inline style as well
+        modal.style.display = 'none';
+    }
+}
+
+// Function to show modal - only called when user explicitly requests it
+function showHistoryModal() {
+    const modal = document.getElementById('history-modal');
+    if (modal) {
+        console.log('Explicitly showing modal');
+        // Remove both hidden class and any inline display style
+        modal.classList.remove('hidden');
+        modal.style.display = 'flex';
+        // Re-initialize close button after modal is shown
+        setTimeout(initCloseButton, 100);
     }
 }
 
@@ -37,8 +52,16 @@ function initCloseButton() {
     }
 }
 
+// Ensure modal is hidden on page load
+window.addEventListener('load', function() {
+    hideHistoryModal();
+});
+
 // Wait for DOM to be fully loaded
 document.addEventListener('DOMContentLoaded', function() {
+    // Ensure modal is hidden initially
+    hideHistoryModal();
+    
     // Get the modal and history button
     const modal = document.getElementById('history-modal');
     const historyButton = document.getElementById('history-btn');
@@ -48,8 +71,10 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Add click event to open the modal
     if (historyButton) {
-        historyButton.addEventListener('click', function() {
+        historyButton.addEventListener('click', function(event) {
+            event.preventDefault(); // Prevent any default action
             console.log('History button clicked');
+            
             fetch('/api/chat_history')
                 .then(response => response.json())
                 .then(data => {
@@ -81,15 +106,8 @@ document.addEventListener('DOMContentLoaded', function() {
                         historyList.innerHTML = '<div class="empty-history"><i class="fas fa-info-circle"></i> No chat history.</div>';
                     }
                     
-                    // Show modal
-                    if (modal) {
-                        console.log('Showing modal');
-                        modal.classList.remove('hidden');
-                        // Re-initialize close button after modal is shown
-                        setTimeout(initCloseButton, 100);
-                    } else {
-                        console.error('Modal element not found when trying to show');
-                    }
+                    // Show modal only after data is loaded
+                    showHistoryModal();
                 })
                 .catch(error => {
                     console.error('Error loading chat history:', error);
@@ -120,7 +138,10 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 });
 
-// Backup initialization for cases where DOM might be already loaded
+// Backup initialization for cases where DOM is already loaded
 if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    // Ensure modal is hidden initially
+    hideHistoryModal();
+    // Initialize close button as backup
     setTimeout(initCloseButton, 100);
 }
