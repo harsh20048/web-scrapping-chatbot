@@ -1,159 +1,118 @@
 /**
- * Modal functionality for the chat history
- * This is a standalone script that handles the modal without relying on the main chat.js file
+ * Simplified chat history modal functionality
+ * Completely rewritten to use direct DOM manipulation with inline styles
  */
 
-// Define global function for hiding modal that will be available immediately
-function hideHistoryModal() {
-    const modal = document.getElementById('history-modal');
-    if (modal) {
-        console.log('Hiding modal via global function');
-        modal.classList.add('hidden');
-        // Ensure modal is fully hidden with inline style as well
-        modal.style.display = 'none';
+// Define a variable to store the current chat history data
+let chatHistoryData = [];
+
+// Function to hide the history overlay
+function hideHistoryOverlay() {
+    const overlay = document.getElementById('history-overlay');
+    if (overlay) {
+        overlay.style.display = 'none';
     }
 }
 
-// Function to show modal - only called when user explicitly requests it
-function showHistoryModal() {
-    const modal = document.getElementById('history-modal');
-    if (modal) {
-        console.log('Explicitly showing modal');
-        // Remove both hidden class and any inline display style
-        modal.classList.remove('hidden');
-        modal.style.display = 'flex';
-        // Re-initialize close button after modal is shown
-        setTimeout(initCloseButton, 100);
+// Function to show the history overlay
+function showHistoryOverlay() {
+    const overlay = document.getElementById('history-overlay');
+    if (overlay) {
+        overlay.style.display = 'block';
     }
 }
 
-// Function to initialize close button - can be called multiple times
-function initCloseButton() {
-    const closeButton = document.getElementById('close-history');
-    if (closeButton) {
-        // Remove any existing event listeners by cloning and replacing
-        const newCloseBtn = closeButton.cloneNode(true);
-        closeButton.parentNode.replaceChild(newCloseBtn, closeButton);
-        
-        // Add new event listener
-        newCloseBtn.addEventListener('click', function(event) {
-            console.log('Close button clicked');
-            event.preventDefault();
-            event.stopPropagation();
-            hideHistoryModal();
-            return false;
-        });
-        
-        // Add additional cursor style to ensure it looks clickable
-        newCloseBtn.style.cursor = 'pointer';
-        console.log('Close button initialized with event listener');
-    } else {
-        console.error('Close button (#close-history) not found when initializing');
-    }
-}
-
-// Ensure modal is hidden on page load
-window.addEventListener('load', function() {
-    hideHistoryModal();
-});
-
-// Wait for DOM to be fully loaded
-document.addEventListener('DOMContentLoaded', function() {
-    // Ensure modal is hidden initially
-    hideHistoryModal();
+// Function to populate the history list
+function populateHistoryList(history) {
+    const historyList = document.getElementById('history-list');
+    if (!historyList) return;
     
-    // Get the modal and history button
-    const modal = document.getElementById('history-modal');
-    const historyButton = document.getElementById('history-btn');
-    const downloadButton = document.getElementById('download-history');
+    historyList.innerHTML = ''; // Clear previous content
     
-    // Initialize close button
-    initCloseButton();
-    
-    // Add download functionality
-    if (downloadButton) {
-        downloadButton.addEventListener('click', function() {
-            console.log('Download button clicked');
-            // Redirect to the download endpoint
-            window.open('/api/download_chat_history', '_blank');
-        });
-    } else {
-        console.error('Download button not found');
-    }
-    
-    // Add click event to open the modal
-    if (historyButton) {
-        historyButton.addEventListener('click', function(event) {
-            event.preventDefault(); // Prevent any default action
-            console.log('History button clicked');
+    if (history && history.length > 0) {
+        history.forEach(item => {
+            const div = document.createElement('div');
+            div.style.padding = '10px';
+            div.style.margin = '5px 0';
+            div.style.borderRadius = '4px';
+            div.style.backgroundColor = item.role === 'user' ? '#f0f7ff' : '#f5f5f5';
             
+            const roleLabel = item.role === 'user' ? 'You' : 'Bot';
+            const message = typeof item.message === 'string' 
+                ? item.message 
+                : JSON.stringify(item.message);
+            
+            div.innerHTML = `<strong>${roleLabel}:</strong> ${message}`;
+            historyList.appendChild(div);
+        });
+    } else {
+        const emptyDiv = document.createElement('div');
+        emptyDiv.style.padding = '20px';
+        emptyDiv.style.textAlign = 'center';
+        emptyDiv.style.color = '#666';
+        emptyDiv.textContent = 'No chat history available.';
+        historyList.appendChild(emptyDiv);
+    }
+}
+
+// Initialize everything when the DOM is fully loaded
+document.addEventListener('DOMContentLoaded', function() {
+    // Make sure the overlay is hidden on page load
+    hideHistoryOverlay();
+    
+    // Add click handler to the history button
+    const historyBtn = document.getElementById('history-btn');
+    if (historyBtn) {
+        historyBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            
+            // Fetch the chat history
             fetch('/api/chat_history')
                 .then(response => response.json())
                 .then(data => {
-                    const historyList = document.getElementById('history-list');
-                    if (!historyList) {
-                        console.error('History list element not found');
-                        return;
-                    }
-                    historyList.innerHTML = ''; // Clear previous history
-                    
-                    if (data.history && data.history.length > 0) {
-                        data.history.forEach(item => {
-                            const div = document.createElement('div');
-                            div.className = 'history-item ' + item.role;
-                            
-                            const roleIcon = item.role === 'user' 
-                                ? '<i class="fas fa-user"></i>' 
-                                : '<i class="fas fa-robot"></i>';
-                            
-                            const roleLabel = item.role === 'user' ? 'You' : 'Bot';
-                            const message = typeof item.message === 'string' 
-                                ? item.message 
-                                : JSON.stringify(item.message);
-                            
-                            div.innerHTML = `<strong>${roleIcon} ${roleLabel}:</strong> ${message}`;
-                            historyList.appendChild(div);
-                        });
-                    } else {
-                        historyList.innerHTML = '<div class="empty-history"><i class="fas fa-info-circle"></i> No chat history.</div>';
-                    }
-                    
-                    // Show modal only after data is loaded
-                    showHistoryModal();
+                    chatHistoryData = data.history || [];
+                    populateHistoryList(chatHistoryData);
+                    showHistoryOverlay();
                 })
                 .catch(error => {
-                    console.error('Error loading chat history:', error);
-                    const historyList = document.getElementById('history-list');
-                    if (historyList) {
-                        historyList.innerHTML = '<div class="empty-history error"><i class="fas fa-exclamation-triangle"></i> Error loading history.</div>';
-                    }
+                    console.error('Error fetching chat history:', error);
+                    chatHistoryData = [];
+                    populateHistoryList([]);
+                    showHistoryOverlay();
                 });
         });
-    } else {
-        console.log('History button not found');
     }
-
-    // Close modal when clicking outside of it
-    window.addEventListener('click', function(event) {
-        if (modal && event.target === modal) {
-            console.log('Clicked outside modal content');
-            hideHistoryModal();
-        }
-    });
-
-    // Close modal when pressing Escape key
-    document.addEventListener('keydown', function(event) {
-        if (modal && !modal.classList.contains('hidden') && event.key === 'Escape') {
-            console.log('Escape key pressed');
-            hideHistoryModal();
+    
+    // Add click handler to the close button
+    const closeBtn = document.getElementById('close-history-btn');
+    if (closeBtn) {
+        closeBtn.addEventListener('click', function() {
+            hideHistoryOverlay();
+        });
+    }
+    
+    // Close when clicking on the overlay background
+    const overlay = document.getElementById('history-overlay');
+    if (overlay) {
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) {
+                hideHistoryOverlay();
+            }
+        });
+    }
+    
+    // Close when pressing Escape key
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            hideHistoryOverlay();
         }
     });
 });
 
-// Backup initialization for cases where DOM is already loaded
+// Ensure the overlay is hidden when the page loads
+window.addEventListener('load', hideHistoryOverlay);
+
+// For cases where the DOM is already loaded
 if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    // Ensure modal is hidden initially
-    hideHistoryModal();
-    // Initialize close button as backup
-    setTimeout(initCloseButton, 100);
+    hideHistoryOverlay();
 }
