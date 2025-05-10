@@ -4,82 +4,37 @@ Provides API endpoints and serves the demo interface.
 """
 
 import os
-import json
-import time
-import threading
-import requests
-import re
-import logging
-import traceback
-import argparse
-from datetime import datetime
+import json as _json
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from dotenv import load_dotenv
 from src.rag import RAG
-from src.model_trainer import ModelTrainer
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+from src.ai_extractor import extract_with_diffbot, extract_with_openai
+import threading
+import requests
+import re
 
 # Load environment variables
 load_dotenv()
 
-# Initialize chat history
-chat_history = []
-CHAT_HISTORY_FILE = 'chat_history.json'
-
-try:
-    if os.path.exists(CHAT_HISTORY_FILE):
-        with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            chat_history = json.load(f)
-except Exception as e:
-    logger.error(f"Error loading chat history: {e}")
-    chat_history = []
-
-def save_chat_history():
-    """Save chat history to file."""
-    try:
-        with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(chat_history, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save chat history: {e}")
-
-def store_chat_message(role, message):
-    """Add a message to chat history and save."""
-    global chat_history
-    chat_history.append({'role': role, 'message': message, 'timestamp': time.time()})
-    if len(chat_history) > 200:  # Limit history to 200 messages
-        chat_history = chat_history[-200:]
-    save_chat_history()
-
-# Initialize Flask app
 app = Flask(__name__)
-
 
 # Configuration
 config = {
     'scrape_delay': int(os.getenv('SCRAPE_DELAY', '1')),
     'max_pages': int(os.getenv('MAX_PAGES', '50')),
-    'model_name': os.getenv('MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
     'ollama_host': os.getenv('OLLAMA_HOST', 'http://localhost:11434'),
+    'model_name': os.getenv('DEEP_MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
     'quick_model_name': os.getenv('QUICK_MODEL_NAME', 'llama3.2:3b-instruct-q3_K_M'),
-    'speed_model_name': os.getenv('SPEED_MODEL_NAME', 'phi3:3.8b-mini-4k-instruct-q4_K_M'),  # Upgraded to phi3 for better accuracy
+    'speed_model_name': os.getenv('SPEED_MODEL_NAME', 'llama3.2:1b-instruct-q2_K'),
     'deep_model_name': os.getenv('DEEP_MODEL_NAME', 'phi3.5:3.8b-mini-instruct-q3_K_S'),
-    'deepseek_model_name': os.getenv('DEEPSEEK_MODEL_NAME', 'deepseek-r1:1.5b'),
+    'deepseek_model_name': os.getenv('DEEPSEEK_MODEL_NAME', 'codegemma:2b-code'),
     'chunk_size': int(os.getenv('CHUNK_SIZE', '300')),
     'chunk_overlap': int(os.getenv('CHUNK_OVERLAP', '30')),
     'persist_directory': os.getenv('PERSIST_DIRECTORY', './data/chroma'),
     'collection_name': os.getenv('COLLECTION_NAME', 'website_content')
 }
+
+CHAT_HISTORY_FILE = 'chat_history.json'
 
 def clean_llm_response(response_text):
     """Clean LLM response to remove meta-commentary and reasoning."""
@@ -119,15 +74,19 @@ def clean_llm_response(response_text):
 def load_chat_history():
     try:
         with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return _json.load(f)
     except Exception:
         return []
 
+def save_chat_history():
+    try:
+        with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            _json.dump(chat_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save chat history: {e}")
+
 # Initialize RAG system
 rag = RAG()
-
-# Initialize ModelTrainer
-model_trainer = ModelTrainer(rag)
 
 # Store scraping status
 scraping_status = {
@@ -138,15 +97,13 @@ scraping_status = {
     'elapsed_time': None
 }
 
-# Store training status
-training_status = {
-    'is_training': False,
-    'is_evaluating': False,
-    'generated_examples': 0,
-    'accuracy': None,
-    'error': None,
-    'elapsed_time': None
-}
+chat_history = load_chat_history()
+
+def store_chat_message(role, message):
+    chat_history.append({'role': role, 'message': message})
+    if len(chat_history) > 200:
+        chat_history.pop(0)
+    save_chat_history()
 
 @app.route('/')
 def index():
@@ -165,11 +122,9 @@ def scrape_website():
     url = data.get('url')
     
     if not url:
-        logger.error("No URL provided for scraping")
         return jsonify({'error': 'URL is required'}), 400
     
     if scraping_status['is_scraping']:
-        logger.warning("Already scraping a website")
         return jsonify({
             'error': 'Already scraping a website',
             'current_url': scraping_status['current_url']
@@ -190,8 +145,6 @@ def scrape_website():
             num_docs = rag.scrape_website(url)
             scraping_status['documents_processed'] = num_docs
         except Exception as e:
-            error_details = traceback.format_exc()
-            logger.error(f"Error in scraping: {str(e)}\n{error_details}")
             scraping_status['error'] = str(e)
         finally:
             end_time = time.time()
@@ -211,95 +164,34 @@ def get_scrape_status():
 
 @app.route('/api/query', methods=['POST'])
 def query():
-    """
-    Handle different query modes (flash, deep, deepseek) and return the result.
-    """
-    if not request.json or 'query' not in request.json:
-        logger.error("No query provided in request")
-        return jsonify({'error': 'No query provided'}), 400
+    """API endpoint to query the chatbot."""
+    data = request.json
+    user_query = data.get('query')
+    mode = data.get('mode', 'speed')  # Default to speed mode for faster responses
+    if not user_query:
+        return jsonify({'error': 'Query is required'}), 400
+    # Get optional parameters with defaults
+    n_results = data.get('n_results', 1)  # Default to 1 result for speed
+    temperature = data.get('temperature', 0.3)  # Lower temperature for more focused answers
+    max_tokens = data.get('max_tokens', 128)  # Limit token count for faster responses
     
-    user_query = request.json['query']
-    mode = request.json.get('mode', 'flash')  # Default to flash mode
+    store_chat_message('user', user_query)
+    result = rag.query(user_query, n_results=n_results, temperature=temperature, max_tokens=max_tokens, mode=mode)
     
-    logger.info(f"Processing query in {mode} mode: {user_query[:50]}...")
+    # Clean the response to remove any meta-commentary 
+    if 'answer' in result:
+        result['answer'] = clean_llm_response(result['answer'])
     
-    try:
-        if not rag.has_documents():
-            logger.warning("No documents in database for query")
-            return jsonify({'error': 'No documents in database. Please scrape a website first.'}), 400
-        
-        if mode == 'deepseek':
-            # Use deepseek code model
-            temperature = request.json.get('temperature', 0.1)
-            max_tokens = request.json.get('max_tokens', 1024)
-            model_name = config['deepseek_model_name']
-            
-            logger.debug(f"Using deepseek mode with model: {model_name}")
-            
-            result = rag.query(
-                user_query=user_query,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                mode="deepseek"
-            )
-            return jsonify({'answer': result['answer'], 'contexts': result.get('contexts', [])})
-        
-        elif mode == 'deep':
-            # Use phi model for deeper understanding
-            model_name = config['deep_model_name']
-            logger.debug(f"Using deep mode with model: {model_name}")
-            
-            result = rag.query(
-                user_query=user_query,
-                temperature=0.2,
-                max_tokens=1024,
-                mode="deep"
-            )
-            return jsonify({'answer': result['answer'], 'contexts': result.get('contexts', [])})
-            
-        elif mode == 'flash':
-            # Use the fastest model for quick responses
-            model_name = config['speed_model_name']  # Using the speed model for flash mode
-            logger.debug(f"Using flash mode with model: {model_name}")
-            
-            result = rag.query(
-                user_query=user_query,
-                temperature=0.1,
-                max_tokens=512,
-                mode="speed"  # Use speed model for flash mode
-            )
-            # Clean the response to be more direct in flash mode
-            result['answer'] = clean_llm_response(result['answer'])
-            return jsonify({'answer': result['answer'], 'contexts': result.get('contexts', [])})
-            
-        else:
-            # Default RAG query with standard model
-            logger.debug(f"Using default mode: {mode}")
-            # If unknown mode, default to flash mode
-            result = rag.query(
-                user_query=user_query,
-                temperature=0.1,
-                max_tokens=512,
-                mode="speed"  # Use speed model for default
-            )
-            result['answer'] = clean_llm_response(result['answer'])
-            return jsonify({'answer': result['answer'], 'contexts': result.get('contexts', [])})
-            
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in query: {str(e)}\n{error_details}")
-        return jsonify({'error': str(e), 'details': error_details}), 500
+    # Store cleaned response in chat history
+    store_chat_message('bot', result.get('answer', ''))
+    
+    return jsonify(result)
 
 @app.route('/api/reset', methods=['POST'])
 def reset_database():
     """API endpoint to reset the vector database."""
-    try:
-        result = rag.reset_database()
-        return jsonify(result)
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in resetting database: {str(e)}\n{error_details}")
-        return jsonify({'error': str(e), 'details': error_details}), 500
+    result = rag.reset_database()
+    return jsonify(result)
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
@@ -314,46 +206,110 @@ def get_status():
             'model_name': config['model_name']
         })
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in getting status: {str(e)}\n{error_details}")
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'details': error_details
+            'error': str(e)
         }), 500
 
-@app.route('/api/chat_history', methods=['GET', 'POST'])
-def chat_history_endpoint():
-    """API endpoint to get or update chat history."""
-    global chat_history
-    
-    if request.method == 'GET':
-        return jsonify({'history': chat_history})
-    
-    elif request.method == 'POST':
+@app.route('/api/ai_extract', methods=['POST'])
+def ai_extract():
+    """API endpoint for AI-powered structured/semantic extraction using Diffbot or OpenAI."""
+    data = request.json
+    url = data.get('url')
+    provider = data.get('provider', 'diffbot')
+    token = os.getenv('DIFFBOT_TOKEN') or data.get('token')
+    openai_key = os.getenv('OPENAI_API_KEY') or data.get('openai_key')
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
+    if provider == 'openai':
+        # Use OpenAI to extract structured data from scraped content
+        # For demo, fetch content with requests and BeautifulSoup
+        import requests
+        from bs4 import BeautifulSoup
         try:
-            data = request.json
-            if not data:
-                logger.error("No data provided for chat history")
-                return jsonify({'error': 'No data provided'}), 400
-            
-            user_message = data.get('user_message', '')
-            bot_response = data.get('bot_response', '')
-            
-            if not user_message or not bot_response:
-                logger.error("Missing message or response in chat history update")
-                return jsonify({'error': 'Missing message or response'}), 400
-            
-            # Add to chat history
-            store_chat_message('user', user_message)
-            store_chat_message('bot', bot_response)
-            
-            return jsonify({'status': 'success'})
-        
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            text = soup.get_text(separator=' ')
         except Exception as e:
-            error_details = traceback.format_exc()
-            logger.error(f"Error updating chat history: {str(e)}\n{error_details}")
-            return jsonify({'error': str(e), 'details': error_details}), 500
+            return jsonify({'error': f'Failed to fetch or parse page: {e}'}), 500
+        if not openai_key:
+            return jsonify({'error': 'OpenAI API key is required'}), 400
+        store_chat_message('user', f'[AI Extract][OpenAI] {url}')
+        result = extract_with_openai(text, openai_key)
+        store_chat_message('bot', result or '[OpenAI extraction failed]')
+        if result is None:
+            return jsonify({'error': 'OpenAI extraction failed'}), 500
+        return jsonify({'provider': 'openai', 'result': result})
+    # Default: Diffbot
+    if not token:
+        return jsonify({'error': 'Diffbot API token is required'}), 400
+    store_chat_message('user', f'[AI Extract][Diffbot] {url}')
+    result = extract_with_diffbot(url, token)
+    store_chat_message('bot', result or '[Diffbot extraction failed]')
+    if result is None:
+        return jsonify({'error': 'Diffbot extraction failed'}), 500
+    return jsonify({'provider': 'diffbot', 'result': result})
+
+@app.route('/api/ollama_deepseek', methods=['POST'])
+def ollama_deepseek():
+    data = request.get_json()
+    prompt = data.get('prompt', '')
+    if not prompt:
+        return jsonify({'error': 'Prompt is required.'}), 400
+    try:
+        # Retrieve relevant context from scraped content (RAG)
+        rag_result = rag.query(prompt, n_results=3, temperature=0.3, max_tokens=256, mode="deepseek")
+        context_docs = rag_result.get('contexts', [])
+        context_str = ''
+        for i, doc in enumerate(context_docs):
+            title = doc.get('title', '')
+            source = doc.get('source', '')
+            text = doc.get('text', '')
+            context_str += f"[Doc {i+1}] Title: {title}\nSource: {source}\n{text}\n\n"
+        
+        # Updated prompt with stronger instructions against meta-commentary
+        full_prompt = "Context information from website:\n" + \
+            f"{context_str}\n\n" + \
+            f"User question: {prompt}\n\n" + \
+            "Please answer based ONLY on the context information provided above.\n" + \
+            "NEVER respond with phrases like \"As an AI language model\" or other meta-commentary.\n" + \
+            "If the answer is not present in the context, say you don't know.\n" + \
+            "DO NOT explain your reasoning or thinking - provide ONLY the direct answer to the question.\n" + \
+            "Be brief and concise."
+        
+        # Call local Ollama DeepSeek model
+        ollama_url = 'http://localhost:11434/api/generate'
+        payload = {
+            'model': config['deepseek_model_name'],
+            'prompt': full_prompt,
+            'stream': False
+        }
+        resp = requests.post(ollama_url, json=payload, timeout=60)
+        if resp.status_code == 200:
+            result = resp.json()
+            
+            # Clean the response to remove meta-commentary
+            response_text = result.get('response', '').strip()
+            cleaned_response = clean_llm_response(response_text)
+            
+            return jsonify({'result': cleaned_response})
+        else:
+            return jsonify({'error': f'Ollama error: {resp.status_code} {resp.text}'})
+    except Exception as e:
+        return jsonify({'error': f'Ollama exception: {e}'})
+
+@app.route('/api/chat_history', methods=['GET'])
+def get_chat_history():
+    """API endpoint to get chat history."""
+    return jsonify({'history': chat_history})
+
+@app.route('/api/download_chat_history', methods=['GET'])
+def download_chat_history():
+    """API endpoint to download chat history as a JSON file."""
+    response = jsonify({'history': chat_history})
+    response.headers.set('Content-Disposition', 'attachment; filename=chat_history.json')
+    response.headers.set('Content-Type', 'application/json')
+    return response
 
 @app.route('/view_chunks')
 def view_chunks():
@@ -376,166 +332,7 @@ def view_chunks():
         html += '</ul>'
         return html
     except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in viewing chunks: {str(e)}\n{error_details}")
         return f'<p>Error fetching chunks: {e}</p>', 500
-
-@app.route('/api/scraped_data')
-def get_scraped_data():
-    """API endpoint to get all scraped data for display in the UI."""
-    try:
-        # Get view type from query parameters (summary or detailed)
-        view_type = request.args.get('view_type', 'summary')
-        
-        # Get all stored documents (chunks)
-        results = rag.vectordb.collection.get()
-        documents = results.get('documents', [])
-        metadatas = results.get('metadatas', [])
-        
-        # Format the response
-        formatted_docs = []
-        for i, (content, metadata) in enumerate(zip(documents, metadatas)):
-            doc = {
-                'content': content,
-                'metadata': metadata
-            }
-            formatted_docs.append(doc)
-        
-        return jsonify({
-            'status': 'success',
-            'document_count': len(formatted_docs),
-            'documents': formatted_docs
-        })
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error in getting scraped data: {str(e)}\n{error_details}")
-        return jsonify({
-            'status': 'error',
-            'error': str(e),
-            'details': error_details
-        }), 500
-
-@app.route('/api/train_flash_model', methods=['POST'])
-def train_flash_model():
-    """API endpoint to train the Flash model with synthetic QA dataset."""
-    global training_status
-    
-    try:
-        # Check if already training
-        if training_status['is_training']:
-            return jsonify({
-                'status': 'in_progress',
-                'message': 'Training is already in progress',
-                'training_status': training_status
-            })
-        
-        # Get training parameters from request
-        data = request.json or {}
-        num_examples = data.get('num_examples', 50)  # Default to 50 examples
-        
-        # Start training in a separate thread
-        def training_task():
-            global training_status
-            start_time = time.time()
-            training_status['is_training'] = True
-            training_status['error'] = None
-            
-            try:
-                # Generate synthetic dataset
-                training_data = model_trainer.create_synthetic_dataset(num_examples=num_examples)
-                training_status['generated_examples'] = len(training_data)
-                training_status['elapsed_time'] = time.time() - start_time
-                training_status['is_training'] = False
-                logger.info(f"Training completed: {len(training_data)} examples generated")
-            except Exception as e:
-                error_details = traceback.format_exc()
-                logger.error(f"Error in training: {str(e)}\n{error_details}")
-                training_status['error'] = str(e)
-                training_status['is_training'] = False
-        
-        # Start training thread
-        threading.Thread(target=training_task).start()
-        
-        return jsonify({
-            'status': 'started',
-            'message': f'Started training with {num_examples} synthetic examples',
-            'training_status': training_status
-        })
-    
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error starting training: {str(e)}\n{error_details}")
-        return jsonify({
-            'status': 'error',
-            'error': str(e),
-            'details': error_details
-        }), 500
-
-@app.route('/api/evaluate_flash_model', methods=['POST'])
-def evaluate_flash_model():
-    """API endpoint to evaluate the Flash model with the synthetic QA dataset."""
-    global training_status
-    
-    try:
-        # Check if already evaluating
-        if training_status['is_evaluating']:
-            return jsonify({
-                'status': 'in_progress',
-                'message': 'Evaluation is already in progress',
-                'training_status': training_status
-            })
-        
-        # Get evaluation parameters from request
-        data = request.json or {}
-        num_examples = data.get('num_examples', 20)  # Default to 20 examples for evaluation
-        
-        # Start evaluation in a separate thread
-        def evaluation_task():
-            global training_status
-            start_time = time.time()
-            training_status['is_evaluating'] = True
-            training_status['error'] = None
-            
-            try:
-                # Evaluate the model
-                results = model_trainer.evaluate_flash_mode(num_examples=num_examples)
-                training_status['accuracy'] = results['metrics']['accuracy']
-                training_status['elapsed_time'] = time.time() - start_time
-                training_status['is_evaluating'] = False
-                logger.info(f"Evaluation completed: Accuracy = {results['metrics']['accuracy']}")
-            except Exception as e:
-                error_details = traceback.format_exc()
-                logger.error(f"Error in evaluation: {str(e)}\n{error_details}")
-                training_status['error'] = str(e)
-                training_status['is_evaluating'] = False
-        
-        # Start evaluation thread
-        threading.Thread(target=evaluation_task).start()
-        
-        return jsonify({
-            'status': 'started',
-            'message': f'Started evaluation with {num_examples} examples',
-            'training_status': training_status
-        })
-    
-    except Exception as e:
-        error_details = traceback.format_exc()
-        logger.error(f"Error starting evaluation: {str(e)}\n{error_details}")
-        return jsonify({
-            'status': 'error',
-            'error': str(e),
-            'details': error_details
-        }), 500
-
-@app.route('/api/train_status')
-def get_train_status():
-    """API endpoint to get the current training/evaluation status."""
-    global training_status
-    
-    return jsonify({
-        'status': 'success',
-        'training_status': training_status
-    })
 
 if __name__ == '__main__':
     # Create data directory if it doesn't exist
@@ -543,9 +340,6 @@ if __name__ == '__main__':
     
     # Create embed directory if it doesn't exist
     os.makedirs('./embed', exist_ok=True)
-    
-    # Create data directory for training if it doesn't exist
-    os.makedirs('./data', exist_ok=True)
     
     # For development, run with debug=True
     app.run(debug=True, host='0.0.0.0', port=5000)

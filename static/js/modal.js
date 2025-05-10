@@ -65,9 +65,21 @@ document.addEventListener('DOMContentLoaded', function() {
     // Get the modal and history button
     const modal = document.getElementById('history-modal');
     const historyButton = document.getElementById('history-btn');
+    const downloadButton = document.getElementById('download-history');
     
     // Initialize close button
     initCloseButton();
+    
+    // Add download functionality
+    if (downloadButton) {
+        downloadButton.addEventListener('click', function() {
+            console.log('Download button clicked');
+            // Redirect to the download endpoint
+            window.open('/api/download_chat_history', '_blank');
+        });
+    } else {
+        console.error('Download button not found');
+    }
     
     // Add click event to open the modal
     if (historyButton) {
