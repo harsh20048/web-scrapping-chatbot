@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="./assets/logo.png" alt="Auto-Learning Website Chatbot" width="80"/>
-
 # Auto-Learning Website Chatbot
 
 **Embed once. It learns your entire website automatically — no training, no manual input, no maintenance.**
@@ -20,15 +18,6 @@
 
 </div>
 
----
-
-## Demo
-
-> 📹 **[Watch the full demo →](https://your-demo-link.com)**
-
-![Demo Walkthrough](./assets/demo.gif)
-
-*Replace with a screen recording showing the chatbot auto-scraping a website and answering questions in real time.*
 
 ---
 
