@@ -1,6 +1,6 @@
 <div align="center">
 
-# Auto-Learning Website Chatbot
+# Web  Scapping Chatbot
 
 **Embed once. It learns your entire website automatically — no training, no manual input, no maintenance.**
 
